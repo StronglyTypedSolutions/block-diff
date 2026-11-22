@@ -718,6 +718,11 @@ header #summary { white-space: nowrap; }
 .n { position: sticky; left: 0; display: inline-block; width: 4.2em; padding-right: .7em;
   text-align: right; color: var(--dim); background: var(--bg); user-select: none; }
 .t { padding-left: .5em; }
+/* Right pane: line numbers at the right edge, so the code starts next to the gutter. */
+#right .r { display: flex; }
+#right .r .t { flex: 1 0 auto; }
+#right .r .n { order: 2; left: auto; right: 0; padding-right: .7em; padding-left: .7em; }
+#right .tag { right: calc(4.2 * 14px + 6px); }  /* The number column: 4.2em at 14px. */
 .r.d { background: var(--del); } .r.a { background: var(--add); } .r.c { background: var(--chg); }
 .r.m, .r.s, .r.w { background: hsl(var(--h) var(--mv-s) var(--mv-l)); cursor: pointer; }
 /* Changed lines inside a block that moved with changes. */
@@ -880,23 +885,62 @@ function layout(f) {
   return {rowsA, rowsB, ya, yb, dops, folds};
 }
 
+// Border colors of changed blocks, per row class.
+const BORDER = {d: "var(--del-s)", a: "var(--add-s)", c: "var(--chg-s)"};
+
 function buildSide(f, side) {
   const lines = f[side], cls = f["c" + side], spans = f["s" + side], syntax = f["h" + side] || {};
   const rowsIn = side === "a" ? LY.rowsA : LY.rowsB;
   const mv = new Int32Array(lines.length).fill(-1), first = new Set();
   for (const [s, n, mid] of f["m" + side]) { first.add(s); for (let k = 0; k < n; k++) mv[s + k] = mid; }
+
+  // A block is a run of rows with the same move, or else the same change class.
+  // Each block gets a line at its top and bottom in its own color.
+  const key = r => {
+    const e = rowsIn[r];
+    if (e === undefined || typeof e !== "number") return "";
+    if (mv[e] >= 0) return "m" + mv[e];
+    return cls[e] === "e" ? "" : cls[e];
+  };
+  const color = r => {
+    const e = rowsIn[r];
+    return mv[e] >= 0 ? `hsl(${hue(mv[e])} 65% 50%)` : BORDER[cls[e]];
+  };
+  // A block with zero height on this side: a thicker line where it belongs.
+  const gapTop = new Map(), gapBottom = new Map();
+  for (const [t, a1, a2, b1, b2] of LY.dops) {
+    const here = side === "a" ? [a1, a2] : [b1, b2], there = side === "a" ? [b1, b2] : [a1, a2];
+    if (here[0] !== here[1] || there[0] === there[1] || (t !== "d" && t !== "a")) continue;
+    const c = BORDER[t];
+    if (here[0] < rowsIn.length) gapTop.set(here[0], c); else if (rowsIn.length) gapBottom.set(rowsIn.length - 1, c);
+  }
+
   const rows = [];
-  for (const e of rowsIn) {
+  rowsIn.forEach((e, r) => {
+    const shadows = [];
+    const k = key(r);
+    if (k && key(r - 1) !== k) shadows.push(`inset 0 1px 0 ${color(r)}`);
+    if (k && key(r + 1) !== k) shadows.push(`inset 0 -1px 0 ${color(r)}`);
+    if (gapTop.has(r)) shadows.push(`inset 0 2px 0 ${gapTop.get(r)}`);
+    if (gapBottom.has(r)) shadows.push(`inset 0 -2px 0 ${gapBottom.get(r)}`);
+    const shadow = shadows.length ? `box-shadow:${shadows.join(",")};` : "";
+    rows.push(rowHtml(e, side, lines, cls, spans, syntax, mv, first, shadow));
+  });
+  return rows.join("");
+}
+
+function rowHtml(e, side, lines, cls, spans, syntax, mv, first, shadow) {
+  {
     if (typeof e !== "number") {
-      rows.push(`<div class="r fold" data-fold="${e.key}" title="Click to show these lines"><span class="n">⋯</span><span class="t">⋯ ${e.n} identical lines</span></div>`);
-      continue;
+      const st = shadow ? ` style="${shadow}"` : "";
+      return `<div class="r fold" data-fold="${e.key}"${st} title="Click to show these lines"><span class="n">\u22ef</span><span class="t">\u22ef ${e.n} identical lines</span></div>`;
     }
     const i = e, m = mv[i];
-    const attr = m >= 0 ? ` data-m="${m}" style="--h:${hue(m)}"` : "";
+    const style = (m >= 0 ? `--h:${hue(m)};` : "") + shadow;
+    const attr = (m >= 0 ? ` data-m="${m}"` : "") + (style ? ` style="${style}"` : "");
     const tag = m >= 0 && first.has(i) ? `<span class="tag">${esc(tagText(m, side))}</span>` : "";
-    rows.push(`<div class="r ${cls[i]}" data-i="${i}"${attr}><span class="n">${i + 1}</span><span class="t">${lineHtml(lines[i], spans[i], syntax[i])}${tag}</span></div>`);
+    return `<div class="r ${cls[i]}" data-i="${i}"${attr}><span class="n">${i + 1}</span><span class="t">${lineHtml(lines[i], spans[i], syntax[i])}${tag}</span></div>`;
   }
-  return rows.join("");
 }
 
 // Rebuild the panes of the current file. The caller sets the scroll position.
