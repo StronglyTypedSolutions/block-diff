@@ -21,7 +21,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - A minimap with the old file in the left half and the new file in the right half. You can click and drag it.
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
 - Syntax colors for Python files. The colors change only the text, so the diff backgrounds stay clear. Dark mode uses pale pastel colors.
-- Light and dark mode, from the browser setting.
+- Light and dark themes. A button (or `t`) switches between the system theme, dark, and light. The page remembers your choice.
 
 ![Identical lines hidden](docs/folded.png)
 
@@ -76,7 +76,7 @@ The page contains a copy of all files. Thus Git can safely delete its temporary 
 
 ## Settings
 
-The page keeps the "hide identical lines" setting in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
+The page keeps the "hide identical lines" and theme settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
 
 The code uses JetBrains Mono at 14 px with a 20 px line height if the font is installed. Otherwise it uses the default monospace font.
 
@@ -90,6 +90,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `Alt+Shift+Down` / `Alt+Shift+Up`, `j` / `k` | Go to the next or previous file. |
 | `h` | Hide or show identical lines. |
 | `Esc` | Link the panes again after you aligned a block. |
+| `t` | Switch the theme: system, dark, light. |
 
 Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 

@@ -644,6 +644,12 @@ def build_payload(an: Analysis, title: str) -> dict:
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
+<script>
+try {
+  const theme = localStorage.getItem("blockdiff.theme");
+  if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
+} catch (e) { /* storage unavailable */ }
+</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>blockdiff</title>
@@ -656,6 +662,10 @@ HTML = r"""<!doctype html>
   --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
   --syn-b: #8a4b08; --syn-f: #6a5300; --syn-d: #8a4b08;
 }
+/* Theme: "system" follows the browser. data-theme="dark" or "light" forces a theme.
+   Keep the two dark blocks equal. */
+:root { color-scheme: light dark; }
+:root[data-theme="light"] { color-scheme: light; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
@@ -665,6 +675,15 @@ HTML = r"""<!doctype html>
     --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
     --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
   }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
+  --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark: rgba(255, 170, 0, .35);
+  --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
+  --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
+  --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
+  --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
@@ -752,8 +771,9 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
 <body>
 <div id="app">
   <header><b>blockdiff</b><span id="summary"></span>
+    <button id="themebtn" title="Theme: system, dark, or light (t)">System theme (t)</button>
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
-    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines</span></header>
+    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme</span></header>
   <div id="files"></div>
   <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rtitle"></div><div class="otitle"></div>
   <div class="pane" id="left"><div class="content" id="lc"></div></div>
@@ -1218,6 +1238,27 @@ function setFolding(on) {
 }
 FOLDBTN.addEventListener("click", () => setFolding(!folding));
 
+// ---------------------------------------------------------------- theme
+const THEMES = ["system", "dark", "light"];
+const THEME_LABELS = {system: "System theme", dark: "Dark theme", light: "Light theme"};
+const THEMEBTN = document.getElementById("themebtn");
+let theme = document.documentElement.dataset.theme || "system";
+
+function showTheme() {
+  if (theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  THEMEBTN.textContent = THEME_LABELS[theme] + " (t)";
+  requestDraw();
+}
+
+function cycleTheme() {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  try { localStorage.setItem("blockdiff.theme", theme); } catch (e) { /* storage unavailable */ }
+  showTheme();
+}
+THEMEBTN.addEventListener("click", cycleTheme);
+showTheme();
+
 // ---------------------------------------------------------------- navigation
 function flash(pane, line, n) {
   for (let k = 0; k < n; k++) pane.querySelector(`.r[data-i="${line + k}"]`)?.classList.add("flash");
@@ -1271,6 +1312,7 @@ const KEYS = [
   [e => !e.altKey && e.key === "k", () => nextFile(-1)],
   [e => !e.altKey && e.key === "h", () => setFolding(!folding)],
   [e => e.key === "Escape" && isAligned(), () => relink()],
+  [e => !e.altKey && e.key === "t", () => cycleTheme()],
 ];
 
 document.addEventListener("keydown", e => {
