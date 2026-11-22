@@ -740,12 +740,15 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
   color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
 #gutter { display: block; width: 100%; height: 100%; border-left: 1px solid var(--line);
   border-right: 1px solid var(--line); }
-#gutter path { stroke-width: 1; cursor: pointer; }
-#gutter path:hover { stroke-width: 2.5; }
-#gutter .d { fill: var(--del); stroke: var(--del-s); }
-#gutter .a { fill: var(--add); stroke: var(--add-s); }
-#gutter .c { fill: var(--chg); stroke: var(--chg-s); }
-#gutter .f { fill: var(--panel); stroke: var(--line); }
+#gutter g { cursor: pointer; }
+#gutter .fill { stroke: none; }
+#gutter .edge { fill: none; stroke-width: 1; pointer-events: none; }
+#gutter g:hover .edge { stroke-width: 2.5; }
+#gutter g.mv:hover .edge { stroke-width: 3; }
+#gutter .d .fill { fill: var(--del); } #gutter .d .edge { stroke: var(--del-s); }
+#gutter .a .fill { fill: var(--add); } #gutter .a .edge { stroke: var(--add-s); }
+#gutter .c .fill { fill: var(--chg); } #gutter .c .edge { stroke: var(--chg-s); }
+#gutter .f .fill { fill: var(--panel); } #gutter .f .edge { stroke: var(--line); }
 #ov { position: relative; border-left: 1px solid var(--line); background: var(--panel); cursor: pointer;
   touch-action: none; user-select: none; }
 #ov::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; border-left: 1px dashed var(--line); }
@@ -1218,6 +1221,19 @@ function band(a1, a2, b1, b2, W) {
   return `M0 ${a1}C${m} ${a1} ${m} ${b1} ${W} ${b1}L${W} ${b2}C${m} ${b2} ${m} ${a2} 0 ${a2}Z`;
 }
 
+// Only the top and bottom curves of a band, for the outline. The vertical ends where
+// a band meets a pane get no line.
+function bandEdges(a1, a2, b1, b2, W) {
+  const m = W / 2;
+  return `M0 ${a1}C${m} ${a1} ${m} ${b1} ${W} ${b1}M0 ${a2}C${m} ${a2} ${m} ${b2} ${W} ${b2}`;
+}
+
+// A band is a group: the fill (no stroke) and the two edge curves (no fill).
+function bandGroup(attrs, a1, a2, b1, b2, W, fillStyle = "", edgeStyle = "") {
+  return `<g ${attrs}><path class="fill" d="${band(a1, a2, b1, b2, W)}"${fillStyle}/>` +
+    `<path class="edge" d="${bandEdges(a1, a2, b1, b2, W)}"${edgeStyle}/></g>`;
+}
+
 function draw() {
   if (!LY) return;
   const W = G.clientWidth, H = G.clientHeight, lt = L.scrollTop, rt = R.scrollTop;
@@ -1226,7 +1242,7 @@ function draw() {
     if (t === "e") continue;
     const a1 = a1r * LH - lt, a2 = a2r * LH - lt, b1 = b1r * LH - rt, b2 = b2r * LH - rt;
     if (Math.max(a2, b2) < 0 || Math.min(a1, b1) > H) continue;
-    s += `<path class="${t}" data-ra="${a1r}" data-rb="${b1r}" d="${band(a1, a2, b1, b2, W)}"/>`;
+    s += bandGroup(`class="${t}" data-ra="${a1r}" data-rb="${b1r}"`, a1, a2, b1, b2, W);
   }
   D.moves.forEach(([kind, sf, si, df, dj, na, nb], mid) => {
     if (sf !== cur || df !== cur) return;
@@ -1234,7 +1250,8 @@ function draw() {
     const b1 = LY.yb[dj] * LH - rt, b2 = LY.yb[dj + nb] * LH - rt;
     if ((a2 < 0 && b2 < 0) || (a1 > H && b1 > H)) return;
     const h = hue(mid), dash = kind === "similar" ? ' stroke-dasharray="4 3"' : "";
-    s += `<path data-m="${mid}" d="${band(a1, a2, b1, b2, W)}" fill="hsl(${h} 70% 55% / .28)" stroke="hsl(${h} 65% 45%)" stroke-width="1.5"${dash}/>`;
+    s += bandGroup(`class="mv" data-m="${mid}"`, a1, a2, b1, b2, W,
+      ` fill="hsl(${h} 70% 55% / .28)"`, ` stroke="hsl(${h} 65% 45%)" stroke-width="1.5"${dash}`);
   });
   G.innerHTML = s;
   updateThumb();
@@ -1264,7 +1281,7 @@ window.addEventListener("resize", () => applyV(vNow));
 
 // Click a band in the gutter to align its left and right parts.
 G.addEventListener("click", e => {
-  const path = e.target.closest("path");
+  const path = e.target.closest("g");
   if (!path || !LY) return;
   if (path.dataset.m !== undefined) {
     const [kind, sf, si, df, dj, na, nb] = D.moves[+path.dataset.m];
