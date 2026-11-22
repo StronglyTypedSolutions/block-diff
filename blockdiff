@@ -885,8 +885,9 @@ function layout(f) {
   return {rowsA, rowsB, ya, yb, dops, folds};
 }
 
-// Border colors of changed blocks, per row class.
-const BORDER = {d: "var(--del-s)", a: "var(--add-s)", c: "var(--chg-s)"};
+// Fill colors of changed blocks, per row class. Each block grows 1px up and down in
+// its own fill color (an outer shadow), so a block with no lines still shows a band.
+const BORDER = {d: "var(--del)", a: "var(--add)", c: "var(--chg)"};
 
 function buildSide(f, side) {
   const lines = f[side], cls = f["c" + side], spans = f["s" + side], syntax = f["h" + side] || {};
@@ -895,7 +896,7 @@ function buildSide(f, side) {
   for (const [s, n, mid] of f["m" + side]) { first.add(s); for (let k = 0; k < n; k++) mv[s + k] = mid; }
 
   // A block is a run of rows with the same move, or else the same change class.
-  // Each block gets a line at its top and bottom in its own color.
+  // Each block extends 1px above and below in its own fill color.
   const key = r => {
     const e = rowsIn[r];
     if (e === undefined || typeof e !== "number") return "";
@@ -904,9 +905,9 @@ function buildSide(f, side) {
   };
   const color = r => {
     const e = rowsIn[r];
-    return mv[e] >= 0 ? `hsl(${hue(mv[e])} 65% 50%)` : BORDER[cls[e]];
+    return mv[e] >= 0 ? `hsl(${hue(mv[e])} var(--mv-s) var(--mv-l))` : BORDER[cls[e]];
   };
-  // A block with zero height on this side: a thicker line where it belongs.
+  // A block with zero height on this side: a 2px band where it belongs, 1px on each side.
   const gapTop = new Map(), gapBottom = new Map();
   for (const [t, a1, a2, b1, b2] of LY.dops) {
     const here = side === "a" ? [a1, a2] : [b1, b2], there = side === "a" ? [b1, b2] : [a1, a2];
@@ -919,10 +920,10 @@ function buildSide(f, side) {
   rowsIn.forEach((e, r) => {
     const shadows = [];
     const k = key(r);
-    if (k && key(r - 1) !== k) shadows.push(`inset 0 1px 0 ${color(r)}`);
-    if (k && key(r + 1) !== k) shadows.push(`inset 0 -1px 0 ${color(r)}`);
-    if (gapTop.has(r)) shadows.push(`inset 0 2px 0 ${gapTop.get(r)}`);
-    if (gapBottom.has(r)) shadows.push(`inset 0 -2px 0 ${gapBottom.get(r)}`);
+    if (k && key(r - 1) !== k) shadows.push(`0 -1px 0 ${color(r)}`);
+    if (k && key(r + 1) !== k) shadows.push(`0 1px 0 ${color(r)}`);
+    if (gapTop.has(r)) shadows.push(`0 -1px 0 ${gapTop.get(r)}`, `inset 0 1px 0 ${gapTop.get(r)}`);
+    if (gapBottom.has(r)) shadows.push(`0 1px 0 ${gapBottom.get(r)}`, `inset 0 -1px 0 ${gapBottom.get(r)}`);
     const shadow = shadows.length ? `box-shadow:${shadows.join(",")};` : "";
     rows.push(rowHtml(e, side, lines, cls, spans, syntax, mv, first, shadow));
   });
