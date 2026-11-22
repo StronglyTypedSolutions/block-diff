@@ -670,7 +670,7 @@ HTML = r"""<!doctype html>
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
   font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
 #app { display: grid; height: 100vh;
-  grid-template-columns: 300px minmax(0, 1fr) 64px minmax(0, 1fr) 42px;
+  grid-template-columns: 300px minmax(0, 1fr) 128px minmax(0, 1fr) 42px;
   grid-template-rows: auto auto minmax(0, 1fr); }
 header { grid-column: 1 / -1; display: flex; gap: 16px; align-items: baseline;
   padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
