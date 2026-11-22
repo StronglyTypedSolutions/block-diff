@@ -11,7 +11,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 ## Features
 
 - Side-by-side view with synchronized scrolling. Unchanged parts stay aligned.
-- Calm scrolling: both panes follow one shared position, so no pane races through added or removed lines. The mouse wheel scrolls at half speed with smooth easing. Jumps to a change also animate.
+- Calm scrolling: both panes follow one shared position, so no pane races through added or removed lines. The mouse wheel scrolls at half speed with smooth easing. Jumps to a change, clicks on the minimap, and alignments also animate. Long jumps start slowly, so you can follow the direction. Dragging the minimap thumb glides after the pointer.
 - An SVG gutter with curved connectors for removed (red), added (green), and changed (blue) blocks.
 - Moved-block detection, also between files. Each moved block gets its own color, a connector band, and a link label such as "moved to line 229".
 - Detection of blocks that moved and changed. The tool merges the parts of an edited moved block into one block. A dashed band marks these blocks.

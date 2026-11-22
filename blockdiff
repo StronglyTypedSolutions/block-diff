@@ -967,7 +967,7 @@ let drag = null;
 OV.addEventListener("pointerdown", e => {
   if (!LY) return;
   if (e.target.closest(".relink")) { relink(); e.preventDefault(); return; }
-  align = null;
+  relink();  // Fade an alignment out instead of removing it at once.
   // Compute the thumb from the scroll position. The DOM thumb can lag one frame.
   const r = OV.getBoundingClientRect(), total = Math.max(LY.rowsA.length, 1) * LH;
   const vTop = r.top + Math.min(L.scrollTop / total, 1) * r.height;
@@ -976,18 +976,19 @@ OV.addEventListener("pointerdown", e => {
   drag = {grab: onThumb ? e.clientY - vTop : vH / 2, top: r.top, height: r.height};
   try { OV.setPointerCapture(e.pointerId); } catch (err) { /* synthetic event */ }
   OV.classList.add("drag");
-  dragTo(e.clientY);
+  if (!onThumb) dragTo(e.clientY, false);  // A click on the track: a smooth jump.
   e.preventDefault();
 });
-OV.addEventListener("pointermove", e => { if (drag) dragTo(e.clientY); });
+OV.addEventListener("pointermove", e => { if (drag) dragTo(e.clientY, true); });
 const endDrag = () => { drag = null; OV.classList.remove("drag"); };
 OV.addEventListener("pointerup", endDrag);
 OV.addEventListener("pointercancel", endDrag);
 
 // The minimap is direct manipulation, so it moves without animation.
-function dragTo(y) {
+// "follow" eases after the pointer (dragging). Otherwise the move is a smooth jump.
+function dragTo(y, follow) {
   const frac = (y - drag.grab - drag.top) / drag.height;
-  scrollToV(vForTop(L, frac * LY.rowsA.length * LH), false);
+  scrollToV(vForTop(L, frac * LY.rowsA.length * LH, false), true, follow);
 }
 
 // ---------------------------------------------------------------- scroll model
@@ -999,6 +1000,7 @@ function dragTo(y) {
 const WHEEL_SPEED = 0.5;   // Fraction of the browser wheel distance (0.5 = twice as slow).
 const EASE_MS = 150;       // Time constant of the scroll easing, in milliseconds.
 const CONTEXT_ABOVE = 2;   // Rows to show above a change after a jump.
+const FOLLOW_MAX_SCREENS = 0.35;  // Speed limit of follow mode, in screens per 16 ms frame.
 let VS = [], VTOTAL = 0;   // Virtual segments [v0, length, a1, a2, b1, b2] and total length.
 let vNow = 0, vTarget = 0, animating = false, lastT = 0;
 const expected = new Map(); // Scroll positions that the page itself set, per pane.
@@ -1081,11 +1083,11 @@ function vOfRow(row, side) {
 
 // The virtual position that gives a pane a scroll position (scrollbars, keys, minimap).
 // topFor() grows with v nearly everywhere, so a binary search is good enough.
-function vForTop(pane, top) {
+function vForTop(pane, top, withOffset = true) {
   let lo = 0, hi = VTOTAL;
   for (let k = 0; k < 40; k++) {
     const m = (lo + hi) / 2;
-    if (paneTop(pane, m) < top) lo = m; else hi = m;
+    if ((withOffset ? paneTop(pane, m) : topFor(pane, m)) < top) lo = m; else hi = m;
   }
   return (lo + hi) / 2;
 }
@@ -1103,9 +1105,22 @@ function applyV(v, skip = null) {
 }
 
 // Scroll to v, with a smooth easing animation unless "animate" is false.
-function scrollToV(v, animate = true) {
+// Two animation modes:
+// - follow: exponential easing toward a target that can change (wheel, minimap drag).
+// - tween: an ease-in-out curve for a jump longer than one screen. It starts slowly,
+//   so the eye can follow the direction. The duration grows with the distance.
+let tween = null;  // {from, to, t0, dur}
+const easeInOut = p => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+
+function scrollToV(v, animate = true, follow = false) {
   vTarget = clampV(v);
-  if (!animate) { animating = false; applyV(vTarget); return; }
+  if (!animate) { animating = false; tween = null; applyV(vTarget); return; }
+  const screens = Math.abs(vTarget - vNow) / Math.max(L.clientHeight / LH, 1);
+  if (!follow && screens > 1) {
+    tween = {from: vNow, to: vTarget, t0: performance.now(), dur: 220 + 170 * Math.log2(1 + screens)};
+  } else {
+    tween = null;
+  }
   if (!animating) { animating = true; lastT = performance.now(); requestAnimationFrame(step); }
 }
 
@@ -1116,8 +1131,18 @@ function step() {
   const dt = Math.min(Math.max(t - lastT, 0), 100);
   lastT = t;
   const ease = 1 - Math.exp(-dt / EASE_MS);
-  let v = vNow + (vTarget - vNow) * ease;
-  if (Math.abs(vTarget - v) < 0.02) v = vTarget;
+  let v;
+  if (tween) {
+    const p = Math.min((t - tween.t0) / tween.dur, 1);
+    v = tween.from + (tween.to - tween.from) * easeInOut(p);
+    if (p >= 1) { v = tween.to; tween = null; }
+  } else {
+    // Limit the speed, so that a fast flick on the minimap glides instead of jumping.
+    const maxStep = Math.max((L.clientHeight / LH) * FOLLOW_MAX_SCREENS * (dt / 16), 1);
+    const step = Math.max(-maxStep, Math.min(maxStep, (vTarget - vNow) * ease));
+    v = vNow + step;
+    if (Math.abs(vTarget - v) < 0.02) v = vTarget;
+  }
   if (align && align.kTarget !== undefined) {
     const k = align.k ?? 1;
     align.k = k + (align.kTarget - k) * ease;
@@ -1125,7 +1150,7 @@ function step() {
   }
   applyV(v);
   const fading = align && align.kTarget !== undefined;
-  if (v !== vTarget || fading) requestAnimationFrame(step); else animating = false;
+  if (v !== vTarget || tween || fading) requestAnimationFrame(step); else animating = false;
 }
 
 // The mouse wheel moves the shared position at WHEEL_SPEED, with easing.
@@ -1133,7 +1158,7 @@ function onWheel(e) {
   if (!LY || e.ctrlKey || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;  // Zoom and sideways: browser.
   e.preventDefault();
   const px = e.deltaMode === 1 ? e.deltaY * LH : e.deltaMode === 2 ? e.deltaY * L.clientHeight : e.deltaY;
-  scrollToV((animating ? vTarget : vNow) + (px * WHEEL_SPEED) / LH);
+  scrollToV((animating ? vTarget : vNow) + (px * WHEEL_SPEED) / LH, true, true);
 }
 for (const el of [L, R, G]) el.addEventListener("wheel", onWheel, {passive: false});
 
@@ -1177,6 +1202,7 @@ for (const pane of [L, R]) {
     if (other.scrollLeft !== pane.scrollLeft) other.scrollLeft = pane.scrollLeft;
     if (Math.abs(pane.scrollTop - (expected.get(pane) ?? -1e9)) <= 1) { requestDraw(); return; }
     animating = false;
+    tween = null;
     expected.set(pane, pane.scrollTop);
     const v = vForTop(pane, pane.scrollTop);
     vTarget = v;
