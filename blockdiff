@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""blockdiff: side-by-side diff with moved-block and similar-block detection.
+
+The tool writes one self-contained HTML file (inline SVG connectors and JavaScript
+for synchronized scrolling) and opens it in the default browser.
+
+Usage:
+    blockdiff                      # HEAD against the working tree
+    blockdiff HEAD~1               # HEAD~1 against the working tree
+    blockdiff HEAD~1 HEAD          # two revisions
+    blockdiff main...HEAD          # merge base of main and HEAD against HEAD
+    blockdiff --dirs LEFT RIGHT    # two folders (for "git difftool -d")
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import webbrowser
+from dataclasses import dataclass, field
+
+# Detection thresholds.
+MIN_MOVE_ALNUM = 20  # Same minimum as "git diff --color-moved".
+MIN_MOVE_ALNUM_SINGLE_LINE = 50  # A one-line move must be longer to count.
+SIM_START = 0.6  # Token similarity that starts a similar block.
+SIM_LINE = 0.5  # Token similarity that continues a similar block.
+MIN_SIM_LINES = 3  # Minimum number of similar non-blank lines in a similar block.
+MAX_CANDIDATES = 64
+
+TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\d+|\S")
+SPAN_TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
+
+
+@dataclass
+class FileDiff:
+    status: str
+    old_path: str | None
+    new_path: str | None
+    a: list[str]
+    b: list[str]
+    binary: bool = False
+    opcodes: list[tuple[str, int, int, int, int]] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- input
+
+
+def run_git(repo: str, *args: str) -> bytes:
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, check=True).stdout
+
+
+def to_lines(data: bytes | None) -> tuple[list[str], bool]:
+    if data is None:
+        return [], False
+    if b"\0" in data[:8192]:
+        return [], True
+    return data.decode("utf-8", "replace").expandtabs(4).splitlines(), False
+
+
+def git_show(repo: str, rev: str, path: str) -> bytes | None:
+    try:
+        return run_git(repo, "show", f"{rev}:{path}")
+    except subprocess.CalledProcessError:
+        return None
+
+
+def from_git(repo: str, old: str, new: str | None, paths: list[str]) -> list[FileDiff]:
+    top = run_git(repo, "rev-parse", "--show-toplevel").decode().strip()
+    cmd = ["diff", "--name-status", "-z", "-M", old] + ([new] if new else []) + ["--", *paths]
+    parts = run_git(top, *cmd).decode().split("\0")
+    files = []
+    i = 0
+    while i < len(parts) - 1:
+        status = parts[i][0]
+        i += 1
+        if status in "RC":
+            old_path, new_path = parts[i], parts[i + 1]
+            i += 2
+        else:
+            old_path = new_path = parts[i]
+            i += 1
+        old_data = None if status == "A" else git_show(top, old, old_path)
+        if status == "D":
+            new_data = None
+        elif new is None:
+            with open(os.path.join(top, new_path), "rb") as fh:
+                new_data = fh.read()
+        else:
+            new_data = git_show(top, new, new_path)
+        a, bin_a = to_lines(old_data)
+        b, bin_b = to_lines(new_data)
+        files.append(
+            FileDiff(
+                status,
+                None if status == "A" else old_path,
+                None if status == "D" else new_path,
+                a,
+                b,
+                bin_a or bin_b,
+            )
+        )
+    return files
+
+
+def from_dirs(left: str, right: str) -> list[FileDiff]:
+    def walk(root: str) -> set[str]:
+        out = set()
+        for base, _dirs, names in os.walk(root, followlinks=True):
+            for name in names:
+                out.add(os.path.relpath(os.path.join(base, name), root))
+        return out
+
+    def read(root: str, rel: str) -> bytes | None:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    files = []
+    for rel in sorted(walk(left) | walk(right)):
+        old_data, new_data = read(left, rel), read(right, rel)
+        if old_data == new_data:
+            continue
+        status = "A" if old_data is None else "D" if new_data is None else "M"
+        a, bin_a = to_lines(old_data)
+        b, bin_b = to_lines(new_data)
+        files.append(
+            FileDiff(
+                status,
+                None if status == "A" else rel,
+                None if status == "D" else rel,
+                a,
+                b,
+                bin_a or bin_b,
+            )
+        )
+    return files
+
+
+# ----------------------------------------------------------------------- analysis
+
+
+def norm(line: str) -> str:
+    return " ".join(line.split())
+
+
+def alnum(line: str) -> int:
+    return sum(c.isalnum() for c in line)
+
+
+def token_ratio(x: list[str], y: list[str]) -> float:
+    sm = difflib.SequenceMatcher(None, x, y, autojunk=False)
+    if sm.real_quick_ratio() < SIM_LINE or sm.quick_ratio() < SIM_LINE:
+        return 0.0
+    return sm.ratio()
+
+
+def change_spans(x: str, y: str) -> tuple[list[list[int]], list[list[int]]]:
+    """Return the character ranges that differ between two paired lines."""
+    tx, ty = SPAN_TOKEN_RE.findall(x), SPAN_TOKEN_RE.findall(y)
+    px = [0]
+    for t in tx:
+        px.append(px[-1] + len(t))
+    py = [0]
+    for t in ty:
+        py.append(py[-1] + len(t))
+    sx: list[list[int]] = []
+    sy: list[list[int]] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, tx, ty, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 > i1 and x[px[i1] : px[i2]].strip():
+            sx.append([px[i1], px[i2]])
+        if j2 > j1 and y[py[j1] : py[j2]].strip():
+            sy.append([py[j1], py[j2]])
+    return sx, sy
+
+
+@dataclass
+class Move:
+    kind: str  # "moved", "similar", or "reindent"
+    sf: int  # Source file index and first line (old side).
+    si: int
+    df: int  # Destination file index and first line (new side).
+    dj: int
+    na: int  # Number of lines on the old side.
+    nb: int  # Number of lines on the new side.
+    p: int = -1  # First index into Analysis.rem.
+    q: int = -1  # First index into Analysis.add.
+
+
+class Analysis:
+    def __init__(self, files: list[FileDiff]):
+        self.files = files
+        for f in files:
+            if not f.binary:
+                f.opcodes = difflib.SequenceMatcher(None, f.a, f.b, autojunk=False).get_opcodes()
+        # Flat lists of removed and added lines: (file index, line index, opcode index).
+        self.rem: list[tuple[int, int, int]] = []
+        self.add: list[tuple[int, int, int]] = []
+        for fi, f in enumerate(files):
+            for k, (tag, i1, i2, j1, j2) in enumerate(f.opcodes):
+                if tag in ("delete", "replace"):
+                    self.rem += [(fi, i, k) for i in range(i1, i2)]
+                if tag in ("insert", "replace"):
+                    self.add += [(fi, j, k) for j in range(j1, j2)]
+        self.rem_text = [files[fi].a[i] for fi, i, _ in self.rem]
+        self.add_text = [files[fi].b[j] for fi, j, _ in self.add]
+        self.rem_norm = [norm(t) for t in self.rem_text]
+        self.add_norm = [norm(t) for t in self.add_text]
+        self.used_r = [False] * len(self.rem)
+        self.used_a = [False] * len(self.add)
+        self.moves: list[Move] = []
+        self.find_exact_moves()
+        self.rem_tok = [TOKEN_RE.findall(t) for t in self.rem_text]
+        self.add_tok = [TOKEN_RE.findall(t) for t in self.add_text]
+        self.find_similar_blocks()
+        self.merge_fragments()
+
+    @staticmethod
+    def contiguous(lst: list[tuple[int, int, int]], p: int, k: int) -> bool:
+        return p + k < len(lst) and lst[p + k][0] == lst[p][0] and lst[p + k][1] == lst[p][1] + k
+
+    def free(self, p: int, q: int, k: int) -> bool:
+        return (
+            self.contiguous(self.rem, p, k)
+            and self.contiguous(self.add, q, k)
+            and not self.used_r[p + k]
+            and not self.used_a[q + k]
+        )
+
+    def record(self, kind: str, p: int, q: int, n: int) -> None:
+        for k in range(n):
+            self.used_r[p + k] = True
+            self.used_a[q + k] = True
+        self.moves.append(Move(kind, self.rem[p][0], self.rem[p][1], self.add[q][0], self.add[q][1], n, n, p, q))
+
+    def merge_fragments(self, max_gap: int = 3) -> None:
+        """Join neighboring blocks that move between the same places.
+
+        Edited lines split a moved block into fragments. Two fragments merge when the
+        lines between them on both sides are unmatched removed and added lines.
+        """
+        moves = sorted((m for m in self.moves if m.kind != "reindent"), key=lambda m: m.p)
+        merged: list[Move] = []
+        for m in moves:
+            prev = merged[-1] if merged else None
+            if prev is not None and prev.sf == m.sf and prev.df == m.df:
+                ga = m.p - (prev.p + prev.na)
+                gb = m.q - (prev.q + prev.nb)
+                if (
+                    0 <= ga <= max_gap
+                    and 0 <= gb <= max_gap
+                    and self.contiguous(self.rem, prev.p, m.p - prev.p + m.na - 1)
+                    and self.contiguous(self.add, prev.q, m.q - prev.q + m.nb - 1)
+                    and not any(self.used_r[prev.p + prev.na + k] for k in range(ga))
+                    and not any(self.used_a[prev.q + prev.nb + k] for k in range(gb))
+                ):
+                    for k in range(ga):
+                        self.used_r[prev.p + prev.na + k] = True
+                    for k in range(gb):
+                        self.used_a[prev.q + prev.nb + k] = True
+                    prev.na = m.p + m.na - prev.p
+                    prev.nb = m.q + m.nb - prev.q
+                    if ga or gb or m.kind != "moved":
+                        prev.kind = "similar"
+                    continue
+            merged.append(m)
+        self.moves = merged + [m for m in self.moves if m.kind == "reindent"]
+
+    def find_exact_moves(self) -> None:
+        index: dict[str, list[int]] = {}
+        for q, n in enumerate(self.add_norm):
+            if n:
+                index.setdefault(n, []).append(q)
+        for p in range(len(self.rem)):
+            if self.used_r[p] or not self.rem_norm[p]:
+                continue
+            best_n, best_q, best_score = 0, -1, 0
+            for q in index.get(self.rem_norm[p], [])[:MAX_CANDIDATES]:
+                if self.used_a[q]:
+                    continue
+                k = 0
+                while self.free(p, q, k) and self.rem_norm[p + k] == self.add_norm[q + k]:
+                    k += 1
+                while k and not self.rem_norm[p + k - 1]:
+                    k -= 1  # Do not end a block on blank lines.
+                score = sum(alnum(self.rem_text[p + i]) for i in range(k))
+                if score > best_score:
+                    best_n, best_q, best_score = k, q, score
+            if best_q < 0:
+                continue
+            nonblank = sum(1 for i in range(best_n) if self.rem_norm[p + i])
+            if best_score < MIN_MOVE_ALNUM or (nonblank < 2 and best_score < MIN_MOVE_ALNUM_SINGLE_LINE):
+                continue
+            same_hunk = self.rem[p][0] == self.add[best_q][0] and self.rem[p][2] == self.add[best_q][2]
+            kind = "reindent" if same_hunk else "moved"
+            self.record(kind, p, best_q, best_n)
+
+    def find_similar_blocks(self) -> None:
+        # Index added lines by identifier tokens to find candidates fast.
+        postings: dict[str, list[int]] = {}
+        for q, toks in enumerate(self.add_tok):
+            if self.used_a[q]:
+                continue
+            for t in set(toks):
+                if len(t) >= 3 and (t[0].isalpha() or t[0] == "_"):
+                    postings.setdefault(t, []).append(q)
+        for p in range(len(self.rem)):
+            if self.used_r[p] or not self.rem_norm[p]:
+                continue
+            keys = sorted(
+                {t for t in self.rem_tok[p] if t in postings},
+                key=lambda t: len(postings[t]),
+            )[:2]
+            cands = sorted({q for t in keys for q in postings[t][:MAX_CANDIDATES]})
+            best_n, best_q, best_good = 0, -1, 0
+            for q in cands:
+                if self.used_a[q]:
+                    continue
+                if self.rem[p][0] == self.add[q][0] and self.rem[p][2] == self.add[q][2]:
+                    continue  # An in-place edit, which the normal diff already shows.
+                if token_ratio(self.rem_tok[p], self.add_tok[q]) < SIM_START:
+                    continue
+                k = good = bad_run = nonblank = 0
+                while self.free(p, q, k):
+                    x, y = self.rem_norm[p + k], self.add_norm[q + k]
+                    if not x and not y:
+                        bad_run = 0
+                    elif x and y and token_ratio(self.rem_tok[p + k], self.add_tok[q + k]) >= SIM_LINE:
+                        good += 1
+                        nonblank += 1
+                        bad_run = 0
+                    else:
+                        nonblank += 1
+                        bad_run += 1
+                        if bad_run > 1:
+                            break
+                    k += 1
+                k -= bad_run
+                nonblank -= bad_run
+                while k and not self.rem_norm[p + k - 1]:
+                    k -= 1
+                if good >= MIN_SIM_LINES and good >= 0.6 * max(nonblank, 1) and good > best_good:
+                    best_n, best_q, best_good = k, q, good
+            if best_q >= 0:
+                self.record("similar", p, best_q, best_n)
+
+
+# ------------------------------------------------------------------------- output
+
+
+# Row classes for blocks. Every row also has the class "r", so do not use "r" here.
+KIND_CLASS = {"moved": "m", "similar": "s", "reindent": "w"}
+
+
+def build_payload(an: Analysis, title: str) -> dict:
+    files = an.files
+    move_a = [[-1] * len(f.a) for f in files]
+    move_b = [[-1] * len(f.b) for f in files]
+    for mid, m in enumerate(an.moves):
+        for k in range(m.na):
+            move_a[m.sf][m.si + k] = mid
+        for k in range(m.nb):
+            move_b[m.df][m.dj + k] = mid
+    out_files = []
+    for fi, f in enumerate(files):
+        ca = ["e"] * len(f.a)
+        cb = ["e"] * len(f.b)
+        sa: dict[int, list] = {}
+        sb: dict[int, list] = {}
+        ops = []
+        for tag, i1, i2, j1, j2 in f.opcodes:
+            t = {"equal": "e", "delete": "d", "insert": "a", "replace": "c"}[tag]
+            ops.append([t, i1, i2, j1, j2])
+            for i in range(i1, i2):
+                ca[i] = "e" if t == "e" else ("d" if t == "d" else "c")
+            for j in range(j1, j2):
+                cb[j] = "e" if t == "e" else ("a" if t == "a" else "c")
+            if tag == "replace":
+                # Pair the changed lines in order to highlight changes inside lines.
+                olds = [i for i in range(i1, i2) if move_a[fi][i] < 0]
+                news = [j for j in range(j1, j2) if move_b[fi][j] < 0]
+                ptr = 0
+                for i in olds:
+                    best, best_j = SIM_LINE, -1
+                    for jj in range(ptr, min(ptr + 8, len(news))):
+                        r = difflib.SequenceMatcher(None, f.a[i], f.b[news[jj]], autojunk=False).ratio()
+                        if r > best:
+                            best, best_j = r, jj
+                    if best_j >= 0:
+                        x, y = change_spans(f.a[i], f.b[news[best_j]])
+                        sa[i], sb[news[best_j]] = x, y
+                        ptr = best_j + 1
+        for i, mid in enumerate(move_a[fi]):
+            if mid >= 0:
+                ca[i] = KIND_CLASS[an.moves[mid].kind]
+        for j, mid in enumerate(move_b[fi]):
+            if mid >= 0:
+                cb[j] = KIND_CLASS[an.moves[mid].kind]
+        out_files.append(
+            {
+                "status": f.status,
+                "old": f.old_path,
+                "new": f.new_path,
+                "binary": f.binary,
+                "a": f.a,
+                "b": f.b,
+                "ca": "".join(ca),
+                "cb": "".join(cb),
+                "sa": sa,
+                "sb": sb,
+                "ops": ops,
+                "ma": [],
+                "mb": [],
+            }
+        )
+    for mid, m in enumerate(an.moves):
+        if m.kind == "similar":
+            # Align the two sides of the block and highlight the edits inside it.
+            xa = files[m.sf].a[m.si : m.si + m.na]
+            yb = files[m.df].b[m.dj : m.dj + m.nb]
+            sm = difflib.SequenceMatcher(None, [norm(x) for x in xa], [norm(y) for y in yb], autojunk=False)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag != "replace":
+                    continue
+                for k in range(min(i2 - i1, j2 - j1)):
+                    x, y = xa[i1 + k], yb[j1 + k]
+                    if norm(x) and norm(y):
+                        sx, sy = change_spans(x, y)
+                        out_files[m.sf]["sa"][m.si + i1 + k] = sx
+                        out_files[m.df]["sb"][m.dj + j1 + k] = sy
+        out_files[m.sf]["ma"].append([m.si, m.na, mid])
+        out_files[m.df]["mb"].append([m.dj, m.nb, mid])
+    moves = [[m.kind, m.sf, m.si, m.df, m.dj, m.na, m.nb] for m in an.moves]
+    return {"title": title, "files": out_files, "moves": moves}
+
+
+HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blockdiff</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1f2328; --dim: #8b949e; --panel: #f6f8fa; --line: #d0d7de;
+  --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark: rgba(255, 170, 0, .45);
+  --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2;
+  --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
+    --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark: rgba(255, 170, 0, .35);
+    --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
+    --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+#app { display: grid; height: 100vh;
+  grid-template-columns: 300px minmax(0, 1fr) 64px minmax(0, 1fr) 42px;
+  grid-template-rows: auto auto minmax(0, 1fr); }
+header { grid-column: 1 / -1; display: flex; gap: 16px; align-items: baseline;
+  padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header b { font-size: 14px; }
+header .help { margin-left: auto; min-width: 0; color: var(--dim); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+header #summary { white-space: nowrap; }
+#files { grid-row: 2 / 4; overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
+.fi { padding: 4px 10px; cursor: pointer; border-left: 3px solid transparent; }
+.fi:hover { background: var(--sel); }
+.fi.cur { background: var(--sel); border-left-color: var(--chg-s); }
+.fi .nm { font-weight: 600; word-break: break-all; }
+.fi .dir { color: var(--dim); font-size: 11px; word-break: break-all; }
+.fi .st { display: inline-block; width: 1.4em; font-weight: 700; }
+.fi .st.A { color: var(--add-s); } .fi .st.D { color: var(--del-s); }
+.fi .st.M { color: var(--chg-s); } .fi .st.R { color: #8250df; }
+.fi .cnt { font-size: 11px; color: var(--dim); }
+.fi .cnt .p { color: var(--add-s); } .fi .cnt .m { color: var(--del-s); }
+.ptitle { padding: 4px 10px; font: 12px ui-monospace, "JetBrains Mono", monospace;
+  border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gtitle, .otitle { border-bottom: 1px solid var(--line); }
+.pane { overflow: auto; position: relative; }
+.content { display: inline-block; min-width: 100%; }
+.r { height: 18px; white-space: pre; font: 12.5px/18px "JetBrains Mono", ui-monospace, monospace; }
+.n { position: sticky; left: 0; display: inline-block; width: 4.2em; padding-right: .7em;
+  text-align: right; color: var(--dim); background: var(--bg); user-select: none; }
+.t { padding-left: .5em; }
+.r.d { background: var(--del); } .r.a { background: var(--add); } .r.c { background: var(--chg); }
+.r.m, .r.s, .r.w { background: hsl(var(--h) var(--mv-s) var(--mv-l)); cursor: pointer; }
+.r.s .t { box-shadow: inset 3px 0 hsl(var(--h) 60% 50%); }
+.r.w { background: hsl(var(--h) 30% var(--mv-l)); }
+.r.flash { outline: 2px solid hsl(var(--h, 210) 70% 50%); outline-offset: -2px; }
+mark { background: var(--mark); color: inherit; border-radius: 2px; }
+.tag { margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
+  color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
+#gutter { display: block; width: 100%; height: 100%; border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line); }
+#gutter path { stroke-width: 1; }
+#gutter .d { fill: var(--del); stroke: var(--del-s); }
+#gutter .a { fill: var(--add); stroke: var(--add-s); }
+#gutter .c { fill: var(--chg); stroke: var(--chg-s); }
+#gutter .f { fill: var(--panel); stroke: var(--line); }
+#ov { position: relative; border-left: 1px solid var(--line); background: var(--panel); cursor: pointer;
+  touch-action: none; user-select: none; }
+#ov::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; border-left: 1px dashed var(--line); }
+#ov .mk { position: absolute; min-height: 2px; }
+#ov .mk.la { left: 3px; width: calc(50% - 5px); } #ov .mk.rb { right: 3px; width: calc(50% - 5px); }
+#ov .d { background: var(--del-s); } #ov .a { background: var(--add-s); } #ov .c { background: var(--chg-s); }
+#ov .mv { background: hsl(var(--h) 60% 50%); }
+#ov .view { position: absolute; left: 0; right: 0; z-index: 1; min-height: 6px; border: 1px solid var(--dim);
+  border-radius: 2px; background: rgba(128, 128, 128, .2); cursor: grab; }
+#ov.drag .view { cursor: grabbing; background: rgba(128, 128, 128, .35); }
+.r.fold { background: var(--panel); color: var(--dim); cursor: pointer; font-style: italic; }
+.r.fold:hover { color: var(--fg); }
+header button { white-space: nowrap; font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+header button[aria-pressed="true"] { background: var(--chg); border-color: var(--chg-s); }
+.binary { padding: 20px; color: var(--dim); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header><b>blockdiff</b><span id="summary"></span>
+    <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
+    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; click a colored block: go to its counterpart</span></header>
+  <div id="files"></div>
+  <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rtitle"></div><div class="otitle"></div>
+  <div class="pane" id="left"><div class="content" id="lc"></div></div>
+  <svg id="gutter"></svg>
+  <div class="pane" id="right"><div class="content" id="rc"></div></div>
+  <div id="ov"></div>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const LH = 18;   // Row height in pixels.
+const CTX = 3;   // Context lines kept around each change when identical lines are hidden.
+const L = document.getElementById("left"), R = document.getElementById("right");
+const G = document.getElementById("gutter"), OV = document.getElementById("ov");
+const FOLDBTN = document.getElementById("foldbtn");
+let cur = -1, master = L, drawPending = false;
+let LY = null;                 // Layout of the current file (see layout()).
+const expanded = new Set();    // Folds that the user opened, as "file:line" keys.
+let folding = false;
+try { folding = localStorage.getItem("blockdiff.fold") === "1"; } catch (e) { /* storage unavailable */ }
+
+const hue = id => (id * 137.508 + 25) % 360;
+const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const pathOf = f => f.new || f.old;
+const base = p => p.slice(p.lastIndexOf("/") + 1);
+
+function lineHtml(text, spans) {
+  if (!spans || !spans.length) return esc(text);
+  let out = "", p = 0;
+  for (const [s, e] of spans) { out += esc(text.slice(p, s)) + "<mark>" + esc(text.slice(s, e)) + "</mark>"; p = e; }
+  return out + esc(text.slice(p));
+}
+
+function tagText(mid, side) {
+  const [kind, sf, si, df, dj] = D.moves[mid];
+  const otherFile = side === "a" ? df : sf, otherLine = (side === "a" ? dj : si) + 1;
+  const where = otherFile === cur ? "line " + otherLine : base(pathOf(D.files[otherFile])) + ":" + otherLine;
+  if (kind === "reindent") return "indentation changed";
+  const edited = kind === "similar" ? " with changes" : "";
+  return side === "a" ? `⇢ moved${edited} to ${where}` : `⇠ moved${edited} from ${where}`;
+}
+
+// ---------------------------------------------------------------- layout
+// The layout maps file lines to display rows. When folding is on, each run of
+// identical lines longer than the context becomes one fold row on both sides.
+// Result: rowsA / rowsB (a line index, or a fold object per row), ya / yb (the row
+// of each line, plus one entry for the end), and dops (the opcodes in row units).
+function layout(f) {
+  const rowsA = [], rowsB = [], folds = {};
+  const ya = new Int32Array(f.a.length + 1), yb = new Int32Array(f.b.length + 1);
+  const dops = [];
+  const push = (t, i1, i2, j1, j2) => {
+    const ra = rowsA.length, rb = rowsB.length;
+    for (let i = i1; i < i2; i++) { ya[i] = rowsA.length; rowsA.push(i); }
+    for (let j = j1; j < j2; j++) { yb[j] = rowsB.length; rowsB.push(j); }
+    dops.push([t, ra, rowsA.length, rb, rowsB.length]);
+  };
+  f.ops.forEach(([t, i1, i2, j1, j2], k) => {
+    if (t !== "e" || !folding) return push(t, i1, i2, j1, j2);
+    const h1 = k === 0 ? i1 : i1 + CTX;
+    const h2 = k === f.ops.length - 1 ? i2 : i2 - CTX;
+    const key = cur + ":" + i1;
+    if (h2 - h1 < 2 || expanded.has(key)) return push(t, i1, i2, j1, j2);
+    const g1 = j1 + (h1 - i1), g2 = j1 + (h2 - i1);
+    push("e", i1, h1, j1, g1);
+    const fo = {key, n: h2 - h1, ia: h1, ib: g1};
+    folds[key] = fo;
+    for (let i = h1; i < h2; i++) ya[i] = rowsA.length;
+    for (let j = g1; j < g2; j++) yb[j] = rowsB.length;
+    dops.push(["f", rowsA.length, rowsA.length + 1, rowsB.length, rowsB.length + 1]);
+    rowsA.push(fo);
+    rowsB.push(fo);
+    push("e", h2, i2, g2, j2);
+  });
+  ya[f.a.length] = rowsA.length;
+  yb[f.b.length] = rowsB.length;
+  return {rowsA, rowsB, ya, yb, dops, folds};
+}
+
+function buildSide(f, side) {
+  const lines = f[side], cls = f["c" + side], spans = f["s" + side];
+  const rowsIn = side === "a" ? LY.rowsA : LY.rowsB;
+  const mv = new Int32Array(lines.length).fill(-1), first = new Set();
+  for (const [s, n, mid] of f["m" + side]) { first.add(s); for (let k = 0; k < n; k++) mv[s + k] = mid; }
+  const rows = [];
+  for (const e of rowsIn) {
+    if (typeof e !== "number") {
+      rows.push(`<div class="r fold" data-fold="${e.key}" title="Click to show these lines"><span class="n">⋯</span><span class="t">⋯ ${e.n} identical lines</span></div>`);
+      continue;
+    }
+    const i = e, m = mv[i];
+    const attr = m >= 0 ? ` data-m="${m}" style="--h:${hue(m)}"` : "";
+    const tag = m >= 0 && first.has(i) ? `<span class="tag">${esc(tagText(m, side))}</span>` : "";
+    rows.push(`<div class="r ${cls[i]}" data-i="${i}"${attr}><span class="n">${i + 1}</span><span class="t">${lineHtml(lines[i], spans[i])}${tag}</span></div>`);
+  }
+  return rows.join("");
+}
+
+// Rebuild the panes of the current file. The caller sets the scroll position.
+function render() {
+  const f = D.files[cur];
+  LY = layout(f);
+  const lc = document.getElementById("lc"), rc = document.getElementById("rc");
+  if (f.binary) {
+    lc.innerHTML = rc.innerHTML = '<div class="binary">Binary file</div>';
+  } else {
+    lc.innerHTML = buildSide(f, "a");
+    rc.innerHTML = buildSide(f, "b");
+  }
+  buildOverview(f);
+}
+
+function showFile(i, scrollToFirst = true) {
+  cur = i;
+  const f = D.files[i];
+  document.querySelectorAll(".fi").forEach((el, k) => el.classList.toggle("cur", k === i));
+  document.querySelector(".fi.cur")?.scrollIntoView({block: "nearest"});
+  document.getElementById("ltitle").textContent = f.old || "(added)";
+  document.getElementById("rtitle").textContent = f.new || "(deleted)";
+  render();
+  L.scrollTop = R.scrollTop = 0;
+  if (scrollToFirst) {
+    const op = LY.dops.find(o => o[0] !== "e" && o[0] !== "f");
+    if (op) scrollPaneTo(L, op[1], 1 / 3);
+  }
+  master = L;
+  sync(L);
+}
+
+// ---------------------------------------------------------------- minimap
+// The left half shows the old file, the right half the new file.
+function buildOverview(f) {
+  const na = Math.max(LY.rowsA.length, 1), nb = Math.max(LY.rowsB.length, 1);
+  const mk = (cls, side, r1, r2, n, extra = "") =>
+    `<div class="mk ${side} ${cls}" style="top:${(r1 / n) * 100}%;height:${((r2 - r1) / n) * 100}%${extra}"></div>`;
+  let h = "";
+  for (const [t, a1, a2, b1, b2] of LY.dops) {
+    if (t === "d" || t === "c") h += mk(t, "la", a1, a2, na);
+    if (t === "a" || t === "c") h += mk(t, "rb", b1, b2, nb);
+  }
+  for (const [s, n, mid] of f.ma) h += mk("mv", "la", LY.ya[s], LY.ya[s + n], na, `;--h:${hue(mid)}`);
+  for (const [s, n, mid] of f.mb) h += mk("mv", "rb", LY.yb[s], LY.yb[s + n], nb, `;--h:${hue(mid)}`);
+  OV.innerHTML = h + '<div class="view" id="ovview"></div>';
+}
+
+function updateThumb() {
+  const v = document.getElementById("ovview");
+  if (!v || !LY) return;
+  const total = Math.max(LY.rowsA.length, 1) * LH;
+  v.style.top = Math.min(L.scrollTop / total, 1) * 100 + "%";
+  v.style.height = Math.min(L.clientHeight / total, 1) * 100 + "%";
+}
+
+// Click on the minimap to jump there. Drag the thumb (or anywhere) to scroll.
+let drag = null;
+OV.addEventListener("pointerdown", e => {
+  if (!LY) return;
+  // Compute the thumb from the scroll position. The DOM thumb can lag one frame.
+  const r = OV.getBoundingClientRect(), total = Math.max(LY.rowsA.length, 1) * LH;
+  const vTop = r.top + Math.min(L.scrollTop / total, 1) * r.height;
+  const vH = Math.min(L.clientHeight / total, 1) * r.height;
+  const onThumb = e.clientY >= vTop && e.clientY <= vTop + Math.max(vH, 6);
+  drag = {grab: onThumb ? e.clientY - vTop : vH / 2, top: r.top, height: r.height};
+  try { OV.setPointerCapture(e.pointerId); } catch (err) { /* synthetic event */ }
+  OV.classList.add("drag");
+  dragTo(e.clientY);
+  e.preventDefault();
+});
+OV.addEventListener("pointermove", e => { if (drag) dragTo(e.clientY); });
+const endDrag = () => { drag = null; OV.classList.remove("drag"); };
+OV.addEventListener("pointerup", endDrag);
+OV.addEventListener("pointercancel", endDrag);
+
+function dragTo(y) {
+  const frac = (y - drag.grab - drag.top) / drag.height;
+  L.scrollTop = frac * LY.rowsA.length * LH;
+  master = L;
+  sync(L);
+}
+
+// ---------------------------------------------------------------- scrolling
+function mapRow(x, fromA) {
+  let last = null;
+  for (const [t, a1, a2, b1, b2] of LY.dops) {
+    const s1 = fromA ? a1 : b1, s2 = fromA ? a2 : b2, d1 = fromA ? b1 : a1, d2 = fromA ? b2 : a2;
+    last = [s2, d2];
+    if (s2 > s1 && x >= s1 && x < s2) return d1 + ((x - s1) / (s2 - s1)) * (d2 - d1);
+  }
+  return last ? x - last[0] + last[1] : x;
+}
+
+function sync(from) {
+  if (!LY) return;
+  const other = from === L ? R : L;
+  const c = (from.scrollTop + from.clientHeight / 2) / LH;
+  other.scrollTop = mapRow(c, from === L) * LH - other.clientHeight / 2;
+  other.scrollLeft = from.scrollLeft;
+  requestDraw();
+}
+
+function scrollPaneTo(pane, row, frac) {
+  pane.scrollTop = row * LH - pane.clientHeight * frac;
+}
+
+function requestDraw() {
+  if (drawPending) return;
+  drawPending = true;
+  requestAnimationFrame(() => { drawPending = false; draw(); });
+}
+
+function band(a1, a2, b1, b2, W) {
+  const m = W / 2;
+  return `M0 ${a1}C${m} ${a1} ${m} ${b1} ${W} ${b1}L${W} ${b2}C${m} ${b2} ${m} ${a2} 0 ${a2}Z`;
+}
+
+function draw() {
+  if (!LY) return;
+  const W = G.clientWidth, H = G.clientHeight, lt = L.scrollTop, rt = R.scrollTop;
+  let s = "";
+  for (const [t, a1r, a2r, b1r, b2r] of LY.dops) {
+    if (t === "e") continue;
+    const a1 = a1r * LH - lt, a2 = a2r * LH - lt, b1 = b1r * LH - rt, b2 = b2r * LH - rt;
+    if (Math.max(a2, b2) < 0 || Math.min(a1, b1) > H) continue;
+    s += `<path class="${t}" d="${band(a1, a2, b1, b2, W)}"/>`;
+  }
+  D.moves.forEach(([kind, sf, si, df, dj, na, nb], mid) => {
+    if (sf !== cur || df !== cur) return;
+    const a1 = LY.ya[si] * LH - lt, a2 = LY.ya[si + na] * LH - lt;
+    const b1 = LY.yb[dj] * LH - rt, b2 = LY.yb[dj + nb] * LH - rt;
+    if ((a2 < 0 && b2 < 0) || (a1 > H && b1 > H)) return;
+    const h = hue(mid), dash = kind === "similar" ? ' stroke-dasharray="4 3"' : "";
+    s += `<path d="${band(a1, a2, b1, b2, W)}" fill="hsl(${h} 70% 55% / .28)" stroke="hsl(${h} 65% 45%)" stroke-width="1.5"${dash}/>`;
+  });
+  G.innerHTML = s;
+  updateThumb();
+}
+
+for (const pane of [L, R]) {
+  for (const ev of ["wheel", "mousedown", "touchstart", "keydown"]) {
+    pane.addEventListener(ev, () => { master = pane; }, {passive: true});
+  }
+  pane.addEventListener("scroll", () => { if (pane === master) sync(pane); else requestDraw(); }, {passive: true});
+  pane.addEventListener("click", e => {
+    const fold = e.target.closest(".r.fold");
+    if (fold) return openFold(fold, pane);
+    const row = e.target.closest(".r[data-m]");
+    if (row) goToCounterpart(+row.dataset.m, pane === L ? "a" : "b");
+  });
+}
+window.addEventListener("resize", requestDraw);
+
+// ---------------------------------------------------------------- folding
+function openFold(rowEl, pane) {
+  const fo = LY.folds[rowEl.dataset.fold];
+  const y = rowEl.offsetTop - pane.scrollTop;
+  expanded.add(fo.key);
+  render();
+  pane.scrollTop = (pane === L ? LY.ya[fo.ia] : LY.yb[fo.ib]) * LH - y;
+  master = pane;
+  sync(pane);
+}
+
+// The old-side line at the middle of the left pane, to keep it in place.
+function centerLine() {
+  if (!LY || !LY.rowsA.length) return 0;
+  const r = Math.max(0, Math.min(LY.rowsA.length - 1, Math.floor((L.scrollTop + L.clientHeight / 2) / LH)));
+  const e = LY.rowsA[r];
+  return typeof e === "number" ? e : e.ia;
+}
+
+function setFolding(on) {
+  folding = on;
+  try { localStorage.setItem("blockdiff.fold", on ? "1" : "0"); } catch (e) { /* storage unavailable */ }
+  FOLDBTN.setAttribute("aria-pressed", String(on));
+  FOLDBTN.textContent = (on ? "Show identical lines" : "Hide identical lines") + " (h)";
+  if (cur < 0) return;
+  const line = centerLine();
+  expanded.clear();
+  render();
+  scrollPaneTo(L, LY.ya[line], 0.5);
+  master = L;
+  sync(L);
+}
+FOLDBTN.addEventListener("click", () => setFolding(!folding));
+
+// ---------------------------------------------------------------- navigation
+function flash(pane, line, n) {
+  for (let k = 0; k < n; k++) pane.querySelector(`.r[data-i="${line + k}"]`)?.classList.add("flash");
+  setTimeout(() => pane.querySelectorAll(".flash").forEach(r => r.classList.remove("flash")), 1200);
+}
+
+function goToCounterpart(mid, side) {
+  const [kind, sf, si, df, dj, na, nb] = D.moves[mid];
+  const tf = side === "a" ? df : sf, tl = side === "a" ? dj : si, n = side === "a" ? nb : na;
+  const target = side === "a" ? R : L;
+  if (tf !== cur) {
+    showFile(tf, false);
+    scrollPaneTo(target, (side === "a" ? LY.yb : LY.ya)[tl], 1 / 3);
+    master = target;
+    sync(target);
+  } else {
+    const src = side === "a" ? L : R;
+    const srcRow = side === "a" ? LY.ya[si] : LY.yb[dj];
+    const y = srcRow * LH - src.scrollTop;
+    target.scrollTop = (side === "a" ? LY.yb[dj] : LY.ya[si]) * LH - y;
+    requestDraw();
+  }
+  flash(target, tl, n);
+}
+
+function jumpChange(dir) {
+  const c = (L.scrollTop + L.clientHeight / 3) / LH;
+  const ch = LY.dops.filter(o => o[0] !== "e" && o[0] !== "f");
+  const op = dir > 0 ? ch.find(o => o[1] > c + 0.5) : ch.slice().reverse().find(o => o[1] < c - 0.5);
+  if (op) { scrollPaneTo(L, op[1], 1 / 3); master = L; sync(L); }
+  else if (dir > 0 && cur < D.files.length - 1) showFile(cur + 1);
+  else if (dir < 0 && cur > 0) showFile(cur - 1);
+}
+
+function nextFile(dir) {
+  const i = cur + dir;
+  if (i >= 0 && i < D.files.length) showFile(i);
+}
+
+// Keyboard shortcuts. Several common conventions are supported:
+//   Meld / WinMerge / Araxis: Alt+Down, Alt+Up      VS Code: F7, Shift+F7
+const KEYS = [
+  [e => e.altKey && !e.shiftKey && e.key === "ArrowDown", () => jumpChange(1)],
+  [e => e.altKey && !e.shiftKey && e.key === "ArrowUp", () => jumpChange(-1)],
+  [e => e.altKey && e.shiftKey && e.key === "ArrowDown", () => nextFile(1)],
+  [e => e.altKey && e.shiftKey && e.key === "ArrowUp", () => nextFile(-1)],
+  [e => !e.altKey && !e.shiftKey && e.key === "F7", () => jumpChange(1)],
+  [e => !e.altKey && e.shiftKey && e.key === "F7", () => jumpChange(-1)],
+  [e => !e.altKey && e.key === "n", () => jumpChange(1)],
+  [e => !e.altKey && e.key === "p", () => jumpChange(-1)],
+  [e => !e.altKey && e.key === "j", () => nextFile(1)],
+  [e => !e.altKey && e.key === "k", () => nextFile(-1)],
+  [e => !e.altKey && e.key === "h", () => setFolding(!folding)],
+];
+
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey || e.metaKey) return;
+  const hit = KEYS.find(([match]) => match(e));
+  if (hit) { e.preventDefault(); hit[1](); }
+});
+
+// ---------------------------------------------------------------- start
+(function init() {
+  const list = document.getElementById("files");
+  let adds = 0, dels = 0;
+  D.files.forEach((f, i) => {
+    const counts = {a: 0, d: 0, m: 0};
+    for (const c of f.cb) if (c !== "e") counts.a++;
+    for (const c of f.ca) if (c !== "e") counts.d++;
+    counts.m = f.ma.length + f.mb.length;
+    adds += counts.a; dels += counts.d;
+    const p = pathOf(f), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+    const el = document.createElement("div");
+    el.className = "fi";
+    el.innerHTML = `<div><span class="st ${f.status}">${f.status}</span><span class="nm">${esc(base(p))}</span></div>` +
+      `<div class="dir">${esc(dir)}</div>` +
+      `<div class="cnt"><span class="p">+${counts.a}</span> <span class="m">−${counts.d}</span>` +
+      (counts.m ? ` · ${counts.m} moved/similar block ends` : "") + `</div>`;
+    el.addEventListener("click", () => showFile(i));
+    list.appendChild(el);
+  });
+  const kinds = {moved: 0, similar: 0, reindent: 0};
+  for (const m of D.moves) kinds[m[0]]++;
+  document.getElementById("summary").textContent =
+    `${D.title} · ${D.files.length} files · +${adds} −${dels} · ` +
+    `${kinds.moved} moved, ${kinds.similar} similar, ${kinds.reindent} re-indented blocks`;
+  // Optional deep link: #f=<file index or path suffix>&l=<line on the left side>&fold=1
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.has("fold")) folding = h.get("fold") === "1";
+  FOLDBTN.setAttribute("aria-pressed", String(folding));
+  FOLDBTN.textContent = (folding ? "Show identical lines" : "Hide identical lines") + " (h)";
+  let fi = 0;
+  if (h.has("f")) {
+    const q = h.get("f");
+    fi = /^\d+$/.test(q) ? +q : Math.max(0, D.files.findIndex(f => pathOf(f).endsWith(q)));
+  }
+  if (D.files.length) {
+    showFile(Math.min(fi, D.files.length - 1), !h.has("l"));
+    if (h.has("l")) {
+      const line = Math.max(0, Math.min(+h.get("l") - 1, D.files[cur].a.length));
+      scrollPaneTo(L, LY.ya[line], 1 / 3);
+      master = L;
+      sync(L);
+    }
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def write_html(payload: dict, out: str) -> None:
+    data = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(HTML.replace("__DATA__", data))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("revs", nargs="*", help="zero, one, or two revisions, or A..B / A...B")
+    ap.add_argument("-C", dest="repo", default=".", help="repository path (default: current directory)")
+    ap.add_argument("--dirs", nargs=2, metavar=("LEFT", "RIGHT"), help="compare two folders")
+    ap.add_argument("-o", "--output", help="HTML output file (default: a temporary file)")
+    ap.add_argument("--no-open", action="store_true", help="do not open the browser")
+    ap.add_argument("--paths", nargs="*", default=[], help="limit the diff to these paths")
+    args = ap.parse_args()
+
+    if args.dirs:
+        files = from_dirs(*args.dirs)
+        title = f"{args.dirs[0]} → {args.dirs[1]}"
+    else:
+        revs = args.revs
+        if len(revs) == 1 and "..." in revs[0]:
+            a, b = revs[0].split("...", 1)
+            old = run_git(args.repo, "merge-base", a or "HEAD", b or "HEAD").decode().strip()
+            new: str | None = b or "HEAD"
+            title = revs[0]
+        elif len(revs) == 1 and ".." in revs[0]:
+            a, b = revs[0].split("..", 1)
+            old, new = a or "HEAD", b or "HEAD"
+            title = revs[0]
+        elif len(revs) == 2:
+            old, new = revs
+            title = f"{old} → {new}"
+        elif len(revs) == 1:
+            old, new = revs[0], None
+            title = f"{old} → working tree"
+        elif not revs:
+            old, new = "HEAD", None
+            title = "HEAD → working tree"
+        else:
+            ap.error("give at most two revisions")
+        files = from_git(args.repo, old, new, args.paths)
+
+    files.sort(key=lambda f: f.new_path or f.old_path or "")
+    if not files:
+        print("blockdiff: no differences", file=sys.stderr)
+        return 0
+    payload = build_payload(Analysis(files), title)
+    out = args.output
+    if not out:
+        fd, out = tempfile.mkstemp(prefix="blockdiff-", suffix=".html")
+        os.close(fd)
+    write_html(payload, out)
+    kinds = [m[0] for m in payload["moves"]]
+    print(
+        f"blockdiff: {len(files)} files, {kinds.count('moved')} moved, "
+        f"{kinds.count('similar')} similar, {kinds.count('reindent')} re-indented blocks -> {out}"
+    )
+    if not args.no_open:
+        webbrowser.open("file://" + os.path.abspath(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
