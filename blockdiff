@@ -15,13 +15,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import builtins
 import difflib
+import io
+import keyword
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import webbrowser
 from dataclasses import dataclass, field
 
@@ -162,6 +167,68 @@ def token_ratio(x: list[str], y: list[str]) -> float:
     return sm.ratio()
 
 
+# --------------------------------------------------------------- syntax colors
+
+PY_BUILTINS = set(dir(builtins)) | {"self", "cls"}
+PY_STRING_TOKENS = {tokenize.STRING} | {
+    getattr(tokenize, n) for n in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END") if hasattr(tokenize, n)
+}
+
+
+def python_syntax(lines: list[str]) -> dict[int, list[list]]:
+    """Return syntax ranges per line: {line: [[start, end, class], ...]}.
+
+    Classes: "k" keyword, "s" string, "c" comment, "n" number, "b" builtin,
+    "f" function or class name, "d" decorator. When the code does not tokenize,
+    the function returns the ranges found up to the error.
+    """
+    out: dict[int, list[list]] = {}
+
+    def add(start: tuple[int, int], end: tuple[int, int], cls: str) -> None:
+        (r1, c1), (r2, c2) = start, end
+        for r in range(r1, r2 + 1):
+            if r - 1 >= len(lines):
+                break
+            s = c1 if r == r1 else 0
+            e = c2 if r == r2 else len(lines[r - 1])
+            if e > s:
+                out.setdefault(r - 1, []).append([s, e, cls])
+
+    source = "\n".join(lines) + "\n"
+    prev = None  # Previous significant token.
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            typ, text = tok.type, tok.string
+            if typ == tokenize.COMMENT:
+                add(tok.start, tok.end, "c")
+            elif typ in PY_STRING_TOKENS:
+                add(tok.start, tok.end, "s")
+            elif typ == tokenize.NUMBER:
+                add(tok.start, tok.end, "n")
+            elif typ == tokenize.NAME:
+                if prev is not None and prev.type == tokenize.NAME and prev.string in ("def", "class"):
+                    add(tok.start, tok.end, "f")
+                elif prev is not None and prev.type == tokenize.OP and prev.string == "@":
+                    add(tok.start, tok.end, "d")
+                elif keyword.iskeyword(text):
+                    add(tok.start, tok.end, "k")
+                elif text in PY_BUILTINS and not (prev is not None and prev.string == "."):
+                    add(tok.start, tok.end, "b")
+            elif typ == tokenize.OP and text == "@" and (prev is None or prev.type in (tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT)):
+                add(tok.start, tok.end, "d")
+            if typ not in (tokenize.NL, tokenize.COMMENT):
+                prev = tok
+    except (tokenize.TokenError, SyntaxError):
+        pass
+    return out
+
+
+def syntax_for(path: str | None, lines: list[str]) -> dict[int, list[list]]:
+    if path and path.endswith((".py", ".pyi")):
+        return python_syntax(lines)
+    return {}
+
+
 def change_spans(x: str, y: str) -> tuple[list[list[int]], list[list[int]]]:
     """Return the character ranges that differ between two paired lines."""
     tx, ty = SPAN_TOKEN_RE.findall(x), SPAN_TOKEN_RE.findall(y)
@@ -222,7 +289,9 @@ class Analysis:
         self.rem_tok = [TOKEN_RE.findall(t) for t in self.rem_text]
         self.add_tok = [TOKEN_RE.findall(t) for t in self.add_text]
         self.find_similar_blocks()
+        self.extend_blocks()
         self.merge_fragments()
+        self.fix_kinds()
 
     @staticmethod
     def contiguous(lst: list[tuple[int, int, int]], p: int, k: int) -> bool:
@@ -242,7 +311,81 @@ class Analysis:
             self.used_a[q + k] = True
         self.moves.append(Move(kind, self.rem[p][0], self.rem[p][1], self.add[q][0], self.add[q][1], n, n, p, q))
 
-    def merge_fragments(self, max_gap: int = 3) -> None:
+    def similar_pair(self, p: int, q: int) -> bool:
+        """Return True if removed line p and added line q are both blank or similar."""
+        x, y = self.rem_norm[p], self.add_norm[q]
+        if not x and not y:
+            return True
+        return bool(x and y) and token_ratio(self.rem_tok[p], self.add_tok[q]) >= SIM_LINE
+
+    def extend_blocks(self) -> None:
+        """Grow each block over neighboring lines that are similar on both sides.
+
+        An edited line often stops a block. This step adds such lines to the block.
+        """
+        for m in self.moves:
+            if m.kind == "reindent":
+                continue
+            grown = False
+            # Grow down.
+            while (
+                self.contiguous(self.rem, m.p, m.na)
+                and self.contiguous(self.add, m.q, m.nb)
+                and not self.used_r[m.p + m.na]
+                and not self.used_a[m.q + m.nb]
+                and self.similar_pair(m.p + m.na, m.q + m.nb)
+            ):
+                self.used_r[m.p + m.na] = self.used_a[m.q + m.nb] = True
+                m.na += 1
+                m.nb += 1
+                grown = True
+            # Grow up.
+            while (
+                m.p > 0
+                and m.q > 0
+                and self.rem[m.p - 1][0] == m.sf
+                and self.rem[m.p - 1][1] == m.si - 1
+                and self.add[m.q - 1][0] == m.df
+                and self.add[m.q - 1][1] == m.dj - 1
+                and not self.used_r[m.p - 1]
+                and not self.used_a[m.q - 1]
+                and self.similar_pair(m.p - 1, m.q - 1)
+            ):
+                m.p -= 1
+                m.q -= 1
+                m.si -= 1
+                m.dj -= 1
+                m.na += 1
+                m.nb += 1
+                self.used_r[m.p] = self.used_a[m.q] = True
+                grown = True
+            # Do not start or end a block on blank lines.
+            while m.na > 1 and m.nb > 1 and not self.rem_norm[m.p] and not self.add_norm[m.q]:
+                self.used_r[m.p] = self.used_a[m.q] = False
+                m.p += 1
+                m.q += 1
+                m.si += 1
+                m.dj += 1
+                m.na -= 1
+                m.nb -= 1
+            while m.na > 1 and m.nb > 1 and not self.rem_norm[m.p + m.na - 1] and not self.add_norm[m.q + m.nb - 1]:
+                self.used_r[m.p + m.na - 1] = self.used_a[m.q + m.nb - 1] = False
+                m.na -= 1
+                m.nb -= 1
+            if grown:
+                m.kind = "similar"  # fix_kinds() resets this when the lines are equal.
+
+    def fix_kinds(self) -> None:
+        """Label a block "moved" when its two sides differ only in whitespace."""
+        for m in self.moves:
+            if m.kind != "similar":
+                continue
+            a = [norm(x) for x in self.files[m.sf].a[m.si : m.si + m.na]]
+            b = [norm(y) for y in self.files[m.df].b[m.dj : m.dj + m.nb]]
+            if a == b:
+                m.kind = "moved"
+
+    def merge_fragments(self, max_gap: int = 2) -> None:
         """Join neighboring blocks that move between the same places.
 
         Edited lines split a moved block into fragments. Two fragments merge when the
@@ -255,9 +398,14 @@ class Analysis:
             if prev is not None and prev.sf == m.sf and prev.df == m.df:
                 ga = m.p - (prev.p + prev.na)
                 gb = m.q - (prev.q + prev.nb)
+                # A gap must look like an edit: replaced lines (same count on both
+                # sides) or one inserted or deleted line. A larger one-sided gap means
+                # that unrelated lines were removed or added between two blocks.
+                edit_like = (ga == gb and ga <= max_gap) or max(ga, gb) <= 1
                 if (
-                    0 <= ga <= max_gap
-                    and 0 <= gb <= max_gap
+                    ga >= 0
+                    and gb >= 0
+                    and edit_like
                     and self.contiguous(self.rem, prev.p, m.p - prev.p + m.na - 1)
                     and self.contiguous(self.add, prev.q, m.q - prev.q + m.nb - 1)
                     and not any(self.used_r[prev.p + prev.na + k] for k in range(ga))
@@ -361,6 +509,27 @@ class Analysis:
 KIND_CLASS = {"moved": "m", "similar": "s", "reindent": "w"}
 
 
+def whitespace_change(xa: list[str], yb: list[str]) -> int:
+    """Classify the whitespace differences between lines that are equal after normalization.
+
+    Return 0 for no difference, 1 for indentation only, and 2 for other whitespace.
+    """
+    result = 0
+    sm = difflib.SequenceMatcher(None, [norm(x) for x in xa], [norm(y) for y in yb], autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for k in range(i2 - i1):
+            x, y = xa[i1 + k], yb[j1 + k]
+            if x == y:
+                continue
+            if x.strip() == y.strip():
+                result = max(result, 1)
+            else:
+                return 2
+    return result
+
+
 def build_payload(an: Analysis, title: str) -> dict:
     files = an.files
     move_a = [[-1] * len(f.a) for f in files]
@@ -417,18 +586,41 @@ def build_payload(an: Analysis, title: str) -> dict:
                 "cb": "".join(cb),
                 "sa": sa,
                 "sb": sb,
+                "ha": syntax_for(f.old_path, f.a),
+                "hb": syntax_for(f.new_path, f.b),
                 "ops": ops,
                 "ma": [],
                 "mb": [],
             }
         )
+    for of in out_files:
+        of["ca"], of["cb"] = list(of["ca"]), list(of["cb"])
+    changed_counts = []
+    ws_changes = []
     for mid, m in enumerate(an.moves):
+        changed = 0
+        ws_changes.append(
+            whitespace_change(files[m.sf].a[m.si : m.si + m.na], files[m.df].b[m.dj : m.dj + m.nb])
+        )
         if m.kind == "similar":
             # Align the two sides of the block and highlight the edits inside it.
+            # Only the changed lines keep the "s" class. The other lines are plain moved lines.
             xa = files[m.sf].a[m.si : m.si + m.na]
             yb = files[m.df].b[m.dj : m.dj + m.nb]
+            ca, cb = out_files[m.sf]["ca"], out_files[m.df]["cb"]
+            for k in range(m.na):
+                ca[m.si + k] = KIND_CLASS["moved"]
+            for k in range(m.nb):
+                cb[m.dj + k] = KIND_CLASS["moved"]
             sm = difflib.SequenceMatcher(None, [norm(x) for x in xa], [norm(y) for y in yb], autojunk=False)
             for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "equal":
+                    continue
+                changed += max(i2 - i1, j2 - j1)
+                for i in range(i1, i2):
+                    ca[m.si + i] = KIND_CLASS["similar"]
+                for j in range(j1, j2):
+                    cb[m.dj + j] = KIND_CLASS["similar"]
                 if tag != "replace":
                     continue
                 for k in range(min(i2 - i1, j2 - j1)):
@@ -437,9 +629,15 @@ def build_payload(an: Analysis, title: str) -> dict:
                         sx, sy = change_spans(x, y)
                         out_files[m.sf]["sa"][m.si + i1 + k] = sx
                         out_files[m.df]["sb"][m.dj + j1 + k] = sy
+        changed_counts.append(changed)
         out_files[m.sf]["ma"].append([m.si, m.na, mid])
         out_files[m.df]["mb"].append([m.dj, m.nb, mid])
-    moves = [[m.kind, m.sf, m.si, m.df, m.dj, m.na, m.nb] for m in an.moves]
+    for of in out_files:
+        of["ca"], of["cb"] = "".join(of["ca"]), "".join(of["cb"])
+    moves = [
+        [m.kind, m.sf, m.si, m.df, m.dj, m.na, m.nb, c, w]
+        for m, c, w in zip(an.moves, changed_counts, ws_changes)
+    ]
     return {"title": title, "files": out_files, "moves": moves}
 
 
@@ -455,6 +653,8 @@ HTML = r"""<!doctype html>
   --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark: rgba(255, 170, 0, .45);
   --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2;
   --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
+  --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
+  --syn-b: #8a4b08; --syn-f: #6a5300; --syn-d: #8a4b08;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -462,6 +662,8 @@ HTML = r"""<!doctype html>
     --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark: rgba(255, 170, 0, .35);
     --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
     --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
+    --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
+    --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
   }
 }
 * { box-sizing: border-box; }
@@ -487,22 +689,30 @@ header #summary { white-space: nowrap; }
 .fi .st.M { color: var(--chg-s); } .fi .st.R { color: #8250df; }
 .fi .cnt { font-size: 11px; color: var(--dim); }
 .fi .cnt .p { color: var(--add-s); } .fi .cnt .m { color: var(--del-s); }
-.ptitle { padding: 4px 10px; font: 12px ui-monospace, "JetBrains Mono", monospace;
+.ptitle { padding: 4px 10px; font: 11px "JetBrains Mono", monospace;
   border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gtitle, .otitle { border-bottom: 1px solid var(--line); }
 .pane { overflow: auto; position: relative; }
 .content { display: inline-block; min-width: 100%; }
-.r { height: 18px; white-space: pre; font: 12.5px/18px "JetBrains Mono", ui-monospace, monospace; }
+/* The row height must match LH in the script. */
+.r { height: 20px; white-space: pre; font: 14px/20px "JetBrains Mono", monospace; }
 .n { position: sticky; left: 0; display: inline-block; width: 4.2em; padding-right: .7em;
   text-align: right; color: var(--dim); background: var(--bg); user-select: none; }
 .t { padding-left: .5em; }
 .r.d { background: var(--del); } .r.a { background: var(--add); } .r.c { background: var(--chg); }
 .r.m, .r.s, .r.w { background: hsl(var(--h) var(--mv-s) var(--mv-l)); cursor: pointer; }
-.r.s .t { box-shadow: inset 3px 0 hsl(var(--h) 60% 50%); }
+/* Changed lines inside a block that moved with changes. */
+.r.s { background: hsl(var(--h) var(--mv-s) calc(var(--mv-l) - 7%)); }
+.r.s .t { box-shadow: inset 4px 0 hsl(var(--h) 70% 40%); }
 .r.w { background: hsl(var(--h) 30% var(--mv-l)); }
 .r.flash { outline: 2px solid hsl(var(--h, 210) 70% 50%); outline-offset: -2px; }
+/* Syntax colors. Diff colors are backgrounds, so they combine with these text colors. */
+.kk { color: var(--syn-k); } .ks { color: var(--syn-s); } .kn { color: var(--syn-n); }
+.kc { color: var(--syn-c); font-style: italic; } .kb { color: var(--syn-b); }
+.kf { color: var(--syn-f); } .kd { color: var(--syn-d); }
 mark { background: var(--mark); color: inherit; border-radius: 2px; }
-.tag { margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
+/* Sticky: the label stays visible at the right edge, also after a long line. */
+.tag { position: sticky; right: 6px; display: inline-block; line-height: 17px; margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
   color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
 #gutter { display: block; width: 100%; height: 100%; border-left: 1px solid var(--line);
   border-right: 1px solid var(--line); }
@@ -545,7 +755,7 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
 <script>
 "use strict";
 const D = JSON.parse(document.getElementById("data").textContent);
-const LH = 18;   // Row height in pixels.
+const LH = 20;   // Row height in pixels. Must match the .r height in the CSS.
 const CTX = 3;   // Context lines kept around each change when identical lines are hidden.
 const L = document.getElementById("left"), R = document.getElementById("right");
 const G = document.getElementById("gutter"), OV = document.getElementById("ov");
@@ -553,28 +763,54 @@ const FOLDBTN = document.getElementById("foldbtn");
 let cur = -1, master = L, drawPending = false;
 let LY = null;                 // Layout of the current file (see layout()).
 const expanded = new Set();    // Folds that the user opened, as "file:line" keys.
-let folding = false;
-try { folding = localStorage.getItem("blockdiff.fold") === "1"; } catch (e) { /* storage unavailable */ }
+// Hide identical lines by default. localStorage remembers the last choice of the user.
+let folding = true;
+try {
+  const saved = localStorage.getItem("blockdiff.fold");
+  if (saved !== null) folding = saved === "1";
+} catch (e) { /* storage unavailable */ }
 
 const hue = id => (id * 137.508 + 25) % 360;
 const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const pathOf = f => f.new || f.old;
 const base = p => p.slice(p.lastIndexOf("/") + 1);
 
-function lineHtml(text, spans) {
-  if (!spans || !spans.length) return esc(text);
-  let out = "", p = 0;
-  for (const [s, e] of spans) { out += esc(text.slice(p, s)) + "<mark>" + esc(text.slice(s, e)) + "</mark>"; p = e; }
-  return out + esc(text.slice(p));
+// Render one line. "marks" are change highlights [[start, end], ...]. "syntax" holds
+// syntax ranges [[start, end, class], ...]. Both can overlap, so the line is cut at
+// every range boundary and each piece gets its syntax class and, if needed, a mark.
+function lineHtml(text, marks, syntax) {
+  marks = marks || [];
+  syntax = syntax || [];
+  if (!marks.length && !syntax.length) return esc(text);
+  const cuts = new Set([0, text.length]);
+  for (const [s, e] of marks) { cuts.add(s); cuts.add(e); }
+  for (const [s, e] of syntax) { cuts.add(s); cuts.add(e); }
+  const xs = [...cuts].filter(x => x >= 0 && x <= text.length).sort((a, b) => a - b);
+  let out = "";
+  for (let k = 0; k + 1 < xs.length; k++) {
+    const a = xs[k], b = xs[k + 1];
+    let piece = esc(text.slice(a, b));
+    const syn = syntax.find(r => r[0] <= a && b <= r[1]);
+    if (syn) piece = `<span class="k${syn[2]}">${piece}</span>`;
+    if (marks.some(r => r[0] <= a && b <= r[1])) piece = `<mark>${piece}</mark>`;
+    out += piece;
+  }
+  return out;
 }
 
 function tagText(mid, side) {
-  const [kind, sf, si, df, dj] = D.moves[mid];
+  const [kind, sf, si, df, dj, na, nb, changed, ws] = D.moves[mid];
   const otherFile = side === "a" ? df : sf, otherLine = (side === "a" ? dj : si) + 1;
   const where = otherFile === cur ? "line " + otherLine : base(pathOf(D.files[otherFile])) + ":" + otherLine;
   if (kind === "reindent") return "indentation changed";
-  const edited = kind === "similar" ? " with changes" : "";
-  return side === "a" ? `⇢ moved${edited} to ${where}` : `⇠ moved${edited} from ${where}`;
+  const space = ws === 2 ? "whitespace" : "indentation";
+  let what = "moved";
+  if (kind === "similar") {
+    what += ` with ${changed} changed line${changed === 1 ? "" : "s"}` + (ws ? ` and ${space} changes` : "");
+  } else if (ws) {
+    what += `, only ${space} changed`;
+  }
+  return side === "a" ? `⇢ ${what} to ${where}` : `⇠ ${what} from ${where}`;
 }
 
 // ---------------------------------------------------------------- layout
@@ -615,7 +851,7 @@ function layout(f) {
 }
 
 function buildSide(f, side) {
-  const lines = f[side], cls = f["c" + side], spans = f["s" + side];
+  const lines = f[side], cls = f["c" + side], spans = f["s" + side], syntax = f["h" + side] || {};
   const rowsIn = side === "a" ? LY.rowsA : LY.rowsB;
   const mv = new Int32Array(lines.length).fill(-1), first = new Set();
   for (const [s, n, mid] of f["m" + side]) { first.add(s); for (let k = 0; k < n; k++) mv[s + k] = mid; }
@@ -628,7 +864,7 @@ function buildSide(f, side) {
     const i = e, m = mv[i];
     const attr = m >= 0 ? ` data-m="${m}" style="--h:${hue(m)}"` : "";
     const tag = m >= 0 && first.has(i) ? `<span class="tag">${esc(tagText(m, side))}</span>` : "";
-    rows.push(`<div class="r ${cls[i]}" data-i="${i}"${attr}><span class="n">${i + 1}</span><span class="t">${lineHtml(lines[i], spans[i])}${tag}</span></div>`);
+    rows.push(`<div class="r ${cls[i]}" data-i="${i}"${attr}><span class="n">${i + 1}</span><span class="t">${lineHtml(lines[i], spans[i], syntax[i])}${tag}</span></div>`);
   }
   return rows.join("");
 }
@@ -726,11 +962,16 @@ function mapRow(x, fromA) {
   return last ? x - last[0] + last[1] : x;
 }
 
+// The sync point moves with the scroll position: the top row at the top, the bottom
+// row at the bottom, and proportionally in between (as in Meld). Thus both panes
+// reach their start and their end together, also when one file is much longer.
 function sync(from) {
   if (!LY) return;
   const other = from === L ? R : L;
-  const c = (from.scrollTop + from.clientHeight / 2) / LH;
-  other.scrollTop = mapRow(c, from === L) * LH - other.clientHeight / 2;
+  const max = from.scrollHeight - from.clientHeight;
+  const frac = max > 0 ? Math.min(Math.max(from.scrollTop / max, 0), 1) : 0;
+  const anchor = (from.scrollTop + from.clientHeight * frac) / LH;
+  other.scrollTop = mapRow(anchor, from === L) * LH - other.clientHeight * frac;
   other.scrollLeft = from.scrollLeft;
   requestDraw();
 }
@@ -938,12 +1179,33 @@ def write_html(payload: dict, out: str) -> None:
         fh.write(HTML.replace("__DATA__", data))
 
 
+def open_browser(path: str) -> str:
+    """Open the page in Firefox if it is installed, otherwise in the default browser."""
+    url = "file://" + os.path.abspath(path)
+    firefox = shutil.which("firefox")
+    if firefox:
+        try:
+            # Start a separate process so that blockdiff does not wait for the browser.
+            subprocess.Popen(
+                [firefox, url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return "Firefox"
+        except OSError:
+            pass
+    webbrowser.open(url)
+    return "the default browser"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("revs", nargs="*", help="zero, one, or two revisions, or A..B / A...B")
     ap.add_argument("-C", dest="repo", default=".", help="repository path (default: current directory)")
     ap.add_argument("--dirs", nargs=2, metavar=("LEFT", "RIGHT"), help="compare two folders")
-    ap.add_argument("-o", "--output", help="HTML output file (default: a temporary file)")
+    ap.add_argument("-o", "--output", help="HTML output file (default: /tmp/blockdiff-<uid>/blockdiff.html)")
     ap.add_argument("--no-open", action="store_true", help="do not open the browser")
     ap.add_argument("--paths", nargs="*", default=[], help="limit the diff to these paths")
     args = ap.parse_args()
@@ -982,8 +1244,11 @@ def main() -> int:
     payload = build_payload(Analysis(files), title)
     out = args.output
     if not out:
-        fd, out = tempfile.mkstemp(prefix="blockdiff-", suffix=".html")
-        os.close(fd)
+        # Use a fixed file per user. Firefox gives each local file its own localStorage,
+        # so a fixed path lets the page remember settings such as "hide identical lines".
+        folder = os.path.join(tempfile.gettempdir(), f"blockdiff-{os.getuid()}")
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        out = os.path.join(folder, "blockdiff.html")
     write_html(payload, out)
     kinds = [m[0] for m in payload["moves"]]
     print(
@@ -991,7 +1256,7 @@ def main() -> int:
         f"{kinds.count('similar')} similar, {kinds.count('reindent')} re-indented blocks -> {out}"
     )
     if not args.no_open:
-        webbrowser.open("file://" + os.path.abspath(out))
+        print(f"blockdiff: opened in {open_browser(out)}")
     return 0
 
 
