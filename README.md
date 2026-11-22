@@ -90,7 +90,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `Alt+Shift+Down` / `Alt+Shift+Up`, `j` / `k` | Go to the next or previous file. |
 | `h` | Hide or show identical lines. |
 
-Click a colored block to go to its counterpart. Click a "⋯ N identical lines" row to show those lines.
+Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
 ## How it works
 

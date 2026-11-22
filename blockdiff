@@ -716,7 +716,8 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
   color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
 #gutter { display: block; width: 100%; height: 100%; border-left: 1px solid var(--line);
   border-right: 1px solid var(--line); }
-#gutter path { stroke-width: 1; }
+#gutter path { stroke-width: 1; cursor: pointer; }
+#gutter path:hover { stroke-width: 2.5; }
 #gutter .d { fill: var(--del); stroke: var(--del-s); }
 #gutter .a { fill: var(--add); stroke: var(--add-s); }
 #gutter .c { fill: var(--chg); stroke: var(--chg-s); }
@@ -743,7 +744,7 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
 <div id="app">
   <header><b>blockdiff</b><span id="summary"></span>
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
-    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; click a colored block: go to its counterpart</span></header>
+    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines</span></header>
   <div id="files"></div>
   <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rtitle"></div><div class="otitle"></div>
   <div class="pane" id="left"><div class="content" id="lc"></div></div>
@@ -872,6 +873,7 @@ function buildSide(f, side) {
 // Rebuild the panes of the current file. The caller sets the scroll position.
 function render() {
   const f = D.files[cur];
+  align = null;
   LY = layout(f);
   const lc = document.getElementById("lc"), rc = document.getElementById("rc");
   if (f.binary) {
@@ -992,6 +994,32 @@ function topFor(pane, v) {
   return rowAt(v, pane === L ? "a" : "b") * LH - pane.clientHeight * anchorFrac(v);
 }
 
+// Alignment: clicking a block puts its left and right parts side by side. This needs
+// an extra offset per pane. The offset is full at the aligned position and fades to
+// zero as you scroll away, over one screen or more for far-apart blocks. Thus the
+// panes return to normal sync and never race.
+let align = null;  // {v, a, b, span}: aligned position, offsets in px, fade distance.
+
+function offsetFor(pane, v) {
+  if (!align) return 0;
+  const k = Math.max(0, 1 - Math.abs(v - align.v) / align.span);
+  return (pane === L ? align.a : align.b) * k;
+}
+
+function paneTop(pane, v) {
+  return topFor(pane, v) + offsetFor(pane, v);
+}
+
+// Show display row ra (left) and rb (right) side by side, at one third of the height.
+function alignRows(ra, rb) {
+  const v = clampV((vOfRow(ra, "a") + vOfRow(rb, "b")) / 2);
+  const y = L.clientHeight / 3;
+  const a = ra * LH - y - topFor(L, v), b = rb * LH - y - topFor(R, v);
+  const span = Math.max(L.clientHeight / LH, (2 * Math.max(Math.abs(a), Math.abs(b))) / LH);
+  align = {v, a, b, span};
+  scrollToV(v);
+}
+
 // The virtual position of a display row on one side.
 function vOfRow(row, side) {
   for (const s of VS) {
@@ -1007,7 +1035,7 @@ function vForTop(pane, top) {
   let lo = 0, hi = VTOTAL;
   for (let k = 0; k < 40; k++) {
     const m = (lo + hi) / 2;
-    if (topFor(pane, m) < top) lo = m; else hi = m;
+    if (paneTop(pane, m) < top) lo = m; else hi = m;
   }
   return (lo + hi) / 2;
 }
@@ -1020,7 +1048,7 @@ function setPaneTop(pane, top) {
 // Put both panes (except "skip") at virtual position v.
 function applyV(v, skip = null) {
   vNow = clampV(v);
-  for (const p of [L, R]) if (p !== skip) setPaneTop(p, topFor(p, vNow));
+  for (const p of [L, R]) if (p !== skip) setPaneTop(p, paneTop(p, vNow));
   requestDraw();
 }
 
@@ -1071,7 +1099,7 @@ function draw() {
     if (t === "e") continue;
     const a1 = a1r * LH - lt, a2 = a2r * LH - lt, b1 = b1r * LH - rt, b2 = b2r * LH - rt;
     if (Math.max(a2, b2) < 0 || Math.min(a1, b1) > H) continue;
-    s += `<path class="${t}" d="${band(a1, a2, b1, b2, W)}"/>`;
+    s += `<path class="${t}" data-ra="${a1r}" data-rb="${b1r}" d="${band(a1, a2, b1, b2, W)}"/>`;
   }
   D.moves.forEach(([kind, sf, si, df, dj, na, nb], mid) => {
     if (sf !== cur || df !== cur) return;
@@ -1079,7 +1107,7 @@ function draw() {
     const b1 = LY.yb[dj] * LH - rt, b2 = LY.yb[dj + nb] * LH - rt;
     if ((a2 < 0 && b2 < 0) || (a1 > H && b1 > H)) return;
     const h = hue(mid), dash = kind === "similar" ? ' stroke-dasharray="4 3"' : "";
-    s += `<path d="${band(a1, a2, b1, b2, W)}" fill="hsl(${h} 70% 55% / .28)" stroke="hsl(${h} 65% 45%)" stroke-width="1.5"${dash}/>`;
+    s += `<path data-m="${mid}" d="${band(a1, a2, b1, b2, W)}" fill="hsl(${h} 70% 55% / .28)" stroke="hsl(${h} 65% 45%)" stroke-width="1.5"${dash}/>`;
   });
   G.innerHTML = s;
   updateThumb();
@@ -1105,6 +1133,20 @@ for (const pane of [L, R]) {
   });
 }
 window.addEventListener("resize", () => applyV(vNow));
+
+// Click a band in the gutter to align its left and right parts.
+G.addEventListener("click", e => {
+  const path = e.target.closest("path");
+  if (!path || !LY) return;
+  if (path.dataset.m !== undefined) {
+    const [kind, sf, si, df, dj, na, nb] = D.moves[+path.dataset.m];
+    alignRows(LY.ya[si], LY.yb[dj]);
+    flash(L, si, na);
+    flash(R, dj, nb);
+  } else if (path.dataset.ra !== undefined) {
+    alignRows(+path.dataset.ra, +path.dataset.rb);
+  }
+});
 
 // ---------------------------------------------------------------- folding
 function openFold(rowEl, pane) {
@@ -1149,10 +1191,16 @@ function goToCounterpart(mid, side) {
   const [kind, sf, si, df, dj, na, nb] = D.moves[mid];
   const tf = side === "a" ? df : sf, tl = side === "a" ? dj : si, n = side === "a" ? nb : na;
   const target = side === "a" ? R : L, tside = side === "a" ? "b" : "a";
-  const sameFile = tf === cur;
-  if (!sameFile) showFile(tf, false);
+  if (tf === cur) {
+    alignRows(LY.ya[si], LY.yb[dj]);
+    flash(L, si, na);
+    flash(R, dj, nb);
+    return;
+  }
+  // The other copy is in another file: open it there.
+  showFile(tf, false);
   const row = (tside === "a" ? LY.ya : LY.yb)[tl];
-  scrollToV(vOfRow(row, tside) - CONTEXT_ABOVE, sameFile);
+  scrollToV(vOfRow(row, tside) - CONTEXT_ABOVE, false);
   flash(target, tl, n);
 }
 
