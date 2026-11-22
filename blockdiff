@@ -760,7 +760,7 @@ const CTX = 3;   // Context lines kept around each change when identical lines a
 const L = document.getElementById("left"), R = document.getElementById("right");
 const G = document.getElementById("gutter"), OV = document.getElementById("ov");
 const FOLDBTN = document.getElementById("foldbtn");
-let cur = -1, master = L, drawPending = false;
+let cur = -1, drawPending = false;
 let LY = null;                 // Layout of the current file (see layout()).
 const expanded = new Set();    // Folds that the user opened, as "file:line" keys.
 // Hide identical lines by default. localStorage remembers the last choice of the user.
@@ -880,6 +880,7 @@ function render() {
     lc.innerHTML = buildSide(f, "a");
     rc.innerHTML = buildSide(f, "b");
   }
+  buildVirtual();
   buildOverview(f);
 }
 
@@ -891,13 +892,12 @@ function showFile(i, scrollToFirst = true) {
   document.getElementById("ltitle").textContent = f.old || "(added)";
   document.getElementById("rtitle").textContent = f.new || "(deleted)";
   render();
-  L.scrollTop = R.scrollTop = 0;
+  let v = 0;
   if (scrollToFirst) {
-    const op = LY.dops.find(o => o[0] !== "e" && o[0] !== "f");
-    if (op) scrollPaneTo(L, op[1], 1 / 3);
+    const k = LY.dops.findIndex(o => o[0] !== "e" && o[0] !== "f");
+    if (k >= 0) v = LY.dv[k] - CONTEXT_ABOVE;
   }
-  master = L;
-  sync(L);
+  scrollToV(v, false);
 }
 
 // ---------------------------------------------------------------- minimap
@@ -944,41 +944,113 @@ const endDrag = () => { drag = null; OV.classList.remove("drag"); };
 OV.addEventListener("pointerup", endDrag);
 OV.addEventListener("pointercancel", endDrag);
 
+// The minimap is direct manipulation, so it moves without animation.
 function dragTo(y) {
   const frac = (y - drag.grab - drag.top) / drag.height;
-  L.scrollTop = frac * LY.rowsA.length * LH;
-  master = L;
-  sync(L);
+  scrollToV(vForTop(L, frac * LY.rowsA.length * LH), false);
 }
 
-// ---------------------------------------------------------------- scrolling
-function mapRow(x, fromA) {
-  let last = null;
+// ---------------------------------------------------------------- scroll model
+// Both panes follow one shared position "v", in virtual rows. Each block of the
+// layout counts as long as its longer side. Thus v moves at a steady speed through
+// a block, and the shorter side moves slower or stands still. No pane races.
+// The anchor point moves from the top of the panes (v = 0) to the bottom (v = end),
+// so both panes reach their start and their end together.
+const WHEEL_SPEED = 0.5;   // Fraction of the browser wheel distance (0.5 = twice as slow).
+const EASE_MS = 150;       // Time constant of the scroll easing, in milliseconds.
+const CONTEXT_ABOVE = 2;   // Rows to show above a change after a jump.
+let VS = [], VTOTAL = 0;   // Virtual segments [v0, length, a1, a2, b1, b2] and total length.
+let vNow = 0, vTarget = 0, animating = false, lastT = 0;
+const expected = new Map(); // Scroll positions that the page itself set, per pane.
+
+// Build the virtual segments. Also store the virtual start of each opcode in LY.dv.
+function buildVirtual() {
+  VS = [];
+  LY.dv = [];
+  let v = 0;
   for (const [t, a1, a2, b1, b2] of LY.dops) {
-    const s1 = fromA ? a1 : b1, s2 = fromA ? a2 : b2, d1 = fromA ? b1 : a1, d2 = fromA ? b2 : a2;
-    last = [s2, d2];
-    if (s2 > s1 && x >= s1 && x < s2) return d1 + ((x - s1) / (s2 - s1)) * (d2 - d1);
+    LY.dv.push(v);
+    const len = Math.max(a2 - a1, b2 - b1);
+    if (len > 0) { VS.push([v, len, a1, a2, b1, b2]); v += len; }
   }
-  return last ? x - last[0] + last[1] : x;
+  VTOTAL = v;
 }
 
-// The sync point moves with the scroll position: the top row at the top, the bottom
-// row at the bottom, and proportionally in between (as in Meld). Thus both panes
-// reach their start and their end together, also when one file is much longer.
-function sync(from) {
-  if (!LY) return;
-  const other = from === L ? R : L;
-  const max = from.scrollHeight - from.clientHeight;
-  const frac = max > 0 ? Math.min(Math.max(from.scrollTop / max, 0), 1) : 0;
-  const anchor = (from.scrollTop + from.clientHeight * frac) / LH;
-  other.scrollTop = mapRow(anchor, from === L) * LH - other.clientHeight * frac;
-  other.scrollLeft = from.scrollLeft;
+const clampV = v => Math.min(Math.max(v, 0), VTOTAL);
+const anchorFrac = v => (VTOTAL > 0 ? clampV(v) / VTOTAL : 0);
+
+// The display row (fractional) of one side at virtual position v.
+function rowAt(v, side) {
+  if (!VS.length) return 0;
+  let lo = 0, hi = VS.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (VS[m][0] <= v) lo = m; else hi = m - 1; }
+  const s = VS[lo], f = Math.min(Math.max((v - s[0]) / s[1], 0), 1);
+  return side === "a" ? s[2] + f * (s[3] - s[2]) : s[4] + f * (s[5] - s[4]);
+}
+
+function topFor(pane, v) {
+  return rowAt(v, pane === L ? "a" : "b") * LH - pane.clientHeight * anchorFrac(v);
+}
+
+// The virtual position of a display row on one side.
+function vOfRow(row, side) {
+  for (const s of VS) {
+    const r1 = side === "a" ? s[2] : s[4], r2 = side === "a" ? s[3] : s[5];
+    if (r2 > r1 && row >= r1 && row < r2) return s[0] + ((row - r1) / (r2 - r1)) * s[1];
+  }
+  return row <= 0 ? 0 : VTOTAL;
+}
+
+// The virtual position that gives a pane a scroll position (scrollbars, keys, minimap).
+// topFor() grows with v nearly everywhere, so a binary search is good enough.
+function vForTop(pane, top) {
+  let lo = 0, hi = VTOTAL;
+  for (let k = 0; k < 40; k++) {
+    const m = (lo + hi) / 2;
+    if (topFor(pane, m) < top) lo = m; else hi = m;
+  }
+  return (lo + hi) / 2;
+}
+
+function setPaneTop(pane, top) {
+  pane.scrollTop = top;
+  expected.set(pane, pane.scrollTop);
+}
+
+// Put both panes (except "skip") at virtual position v.
+function applyV(v, skip = null) {
+  vNow = clampV(v);
+  for (const p of [L, R]) if (p !== skip) setPaneTop(p, topFor(p, vNow));
   requestDraw();
 }
 
-function scrollPaneTo(pane, row, frac) {
-  pane.scrollTop = row * LH - pane.clientHeight * frac;
+// Scroll to v, with a smooth easing animation unless "animate" is false.
+function scrollToV(v, animate = true) {
+  vTarget = clampV(v);
+  if (!animate) { animating = false; applyV(vTarget); return; }
+  if (!animating) { animating = true; lastT = performance.now(); requestAnimationFrame(step); }
 }
+
+function step() {
+  if (!animating) return;
+  // Use one clock. The frame timestamp and performance.now() can differ.
+  const t = performance.now();
+  const dt = Math.min(Math.max(t - lastT, 0), 100);
+  lastT = t;
+  let v = vNow + (vTarget - vNow) * (1 - Math.exp(-dt / EASE_MS));
+  if (Math.abs(vTarget - v) < 0.02) v = vTarget;
+  applyV(v);
+  if (v !== vTarget) requestAnimationFrame(step); else animating = false;
+}
+
+// The mouse wheel moves the shared position at WHEEL_SPEED, with easing.
+function onWheel(e) {
+  if (!LY || e.ctrlKey || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;  // Zoom and sideways: browser.
+  e.preventDefault();
+  const px = e.deltaMode === 1 ? e.deltaY * LH : e.deltaMode === 2 ? e.deltaY * L.clientHeight : e.deltaY;
+  scrollToV((animating ? vTarget : vNow) + (px * WHEEL_SPEED) / LH);
+}
+for (const el of [L, R, G]) el.addEventListener("wheel", onWheel, {passive: false});
 
 function requestDraw() {
   if (drawPending) return;
@@ -1014,10 +1086,17 @@ function draw() {
 }
 
 for (const pane of [L, R]) {
-  for (const ev of ["wheel", "mousedown", "touchstart", "keydown"]) {
-    pane.addEventListener(ev, () => { master = pane; }, {passive: true});
-  }
-  pane.addEventListener("scroll", () => { if (pane === master) sync(pane); else requestDraw(); }, {passive: true});
+  // Scrollbars, arrow keys, Page Up/Down: the browser scrolls one pane. Follow it.
+  pane.addEventListener("scroll", () => {
+    const other = pane === L ? R : L;
+    if (other.scrollLeft !== pane.scrollLeft) other.scrollLeft = pane.scrollLeft;
+    if (Math.abs(pane.scrollTop - (expected.get(pane) ?? -1e9)) <= 1) { requestDraw(); return; }
+    animating = false;
+    expected.set(pane, pane.scrollTop);
+    const v = vForTop(pane, pane.scrollTop);
+    vTarget = v;
+    applyV(v, pane);
+  }, {passive: true});
   pane.addEventListener("click", e => {
     const fold = e.target.closest(".r.fold");
     if (fold) return openFold(fold, pane);
@@ -1025,23 +1104,24 @@ for (const pane of [L, R]) {
     if (row) goToCounterpart(+row.dataset.m, pane === L ? "a" : "b");
   });
 }
-window.addEventListener("resize", requestDraw);
+window.addEventListener("resize", () => applyV(vNow));
 
 // ---------------------------------------------------------------- folding
 function openFold(rowEl, pane) {
   const fo = LY.folds[rowEl.dataset.fold];
+  const side = pane === L ? "a" : "b";
   const y = rowEl.offsetTop - pane.scrollTop;
   expanded.add(fo.key);
   render();
-  pane.scrollTop = (pane === L ? LY.ya[fo.ia] : LY.yb[fo.ib]) * LH - y;
-  master = pane;
-  sync(pane);
+  // Keep the opened lines where the fold row was.
+  const row = side === "a" ? LY.ya[fo.ia] : LY.yb[fo.ib];
+  scrollToV(vForTop(pane, row * LH - y), false);
 }
 
-// The old-side line at the middle of the left pane, to keep it in place.
+// The old-side line at the anchor of the left pane, to keep it in place.
 function centerLine() {
   if (!LY || !LY.rowsA.length) return 0;
-  const r = Math.max(0, Math.min(LY.rowsA.length - 1, Math.floor((L.scrollTop + L.clientHeight / 2) / LH)));
+  const r = Math.max(0, Math.min(LY.rowsA.length - 1, Math.floor(rowAt(vNow, "a"))));
   const e = LY.rowsA[r];
   return typeof e === "number" ? e : e.ia;
 }
@@ -1055,9 +1135,7 @@ function setFolding(on) {
   const line = centerLine();
   expanded.clear();
   render();
-  scrollPaneTo(L, LY.ya[line], 0.5);
-  master = L;
-  sync(L);
+  scrollToV(vOfRow(LY.ya[line], "a"), false);
 }
 FOLDBTN.addEventListener("click", () => setFolding(!folding));
 
@@ -1070,27 +1148,20 @@ function flash(pane, line, n) {
 function goToCounterpart(mid, side) {
   const [kind, sf, si, df, dj, na, nb] = D.moves[mid];
   const tf = side === "a" ? df : sf, tl = side === "a" ? dj : si, n = side === "a" ? nb : na;
-  const target = side === "a" ? R : L;
-  if (tf !== cur) {
-    showFile(tf, false);
-    scrollPaneTo(target, (side === "a" ? LY.yb : LY.ya)[tl], 1 / 3);
-    master = target;
-    sync(target);
-  } else {
-    const src = side === "a" ? L : R;
-    const srcRow = side === "a" ? LY.ya[si] : LY.yb[dj];
-    const y = srcRow * LH - src.scrollTop;
-    target.scrollTop = (side === "a" ? LY.yb[dj] : LY.ya[si]) * LH - y;
-    requestDraw();
-  }
+  const target = side === "a" ? R : L, tside = side === "a" ? "b" : "a";
+  const sameFile = tf === cur;
+  if (!sameFile) showFile(tf, false);
+  const row = (tside === "a" ? LY.ya : LY.yb)[tl];
+  scrollToV(vOfRow(row, tside) - CONTEXT_ABOVE, sameFile);
   flash(target, tl, n);
 }
 
 function jumpChange(dir) {
-  const c = (L.scrollTop + L.clientHeight / 3) / LH;
-  const ch = LY.dops.filter(o => o[0] !== "e" && o[0] !== "f");
-  const op = dir > 0 ? ch.find(o => o[1] > c + 0.5) : ch.slice().reverse().find(o => o[1] < c - 0.5);
-  if (op) { scrollPaneTo(L, op[1], 1 / 3); master = L; sync(L); }
+  const now = animating ? vTarget : vNow;
+  const starts = [];
+  LY.dops.forEach((o, k) => { if (o[0] !== "e" && o[0] !== "f") starts.push(clampV(LY.dv[k] - CONTEXT_ABOVE)); });
+  const v = dir > 0 ? starts.find(s => s > now + 0.5) : starts.slice().reverse().find(s => s < now - 0.5);
+  if (v !== undefined) scrollToV(v);
   else if (dir > 0 && cur < D.files.length - 1) showFile(cur + 1);
   else if (dir < 0 && cur > 0) showFile(cur - 1);
 }
@@ -1161,9 +1232,7 @@ document.addEventListener("keydown", e => {
     showFile(Math.min(fi, D.files.length - 1), !h.has("l"));
     if (h.has("l")) {
       const line = Math.max(0, Math.min(+h.get("l") - 1, D.files[cur].a.length));
-      scrollPaneTo(L, LY.ya[line], 1 / 3);
-      master = L;
-      sync(L);
+      scrollToV(vOfRow(LY.ya[line], "a") - CONTEXT_ABOVE, false);
     }
   }
 })();
