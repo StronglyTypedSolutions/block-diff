@@ -89,8 +89,9 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `n` / `p` | Go to the next or previous change. |
 | `Alt+Shift+Down` / `Alt+Shift+Up`, `j` / `k` | Go to the next or previous file. |
 | `h` | Hide or show identical lines. |
+| `Esc` | Link the panes again after you aligned a block. |
 
-Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
+Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
 ## How it works
 
