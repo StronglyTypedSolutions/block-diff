@@ -76,6 +76,15 @@ git difftool -d -t blockdiff HEAD~1
 
 The page contains a copy of all files. Thus Git can safely delete its temporary folders after the call.
 
+Do not set `diff.tool` to `blockdiff`. Without `-d`, Git calls the tool once for each file, and each call replaces the page of the previous file. Keep another tool for single files.
+
+Two aliases make the daily use short:
+
+```bash
+git config --global alias.bd '!blockdiff'                   # git bd main...HEAD
+git config --global alias.bdd 'difftool -d -t blockdiff'    # git bdd HEAD~1
+```
+
 ## Settings
 
 The page keeps the "hide identical lines" and theme settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
