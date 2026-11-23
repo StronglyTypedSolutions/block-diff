@@ -6,7 +6,13 @@ Vibe coded block diff tool with web interface and similar block synchronization.
 
 The design follows Araxis Merge: two synchronized panes with curved connectors between the corresponding blocks.
 
-![Moved block with connectors](docs/moved-block.png)
+![Four moved blocks, aligned side by side, dark theme](docs/moved-blocks-aligned-dark.png)
+
+*A refactor that moves code into a new function. Each moved block has its own color and a link label such as "moved with 2 changed lines to line 729". A click on a label aligns both copies. Word-level highlights show the changed parts. The link button in the minimap links the panes again.*
+
+![A block that moved about 700 lines, light theme](docs/moved-far-light.png)
+
+*A test helper that moved about 700 lines up and changed a little. A click on the label aligns the two copies, with identical lines hidden.*
 
 ## Features
 
@@ -25,7 +31,9 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Syntax colors for Python files. The colors change only the text, so the diff backgrounds stay clear. Dark mode uses pale pastel colors.
 - Light and dark themes. A button (or `t`) switches between the system theme, dark, and light. The page remembers your choice.
 
-![Identical lines hidden](docs/folded.png)
+![Identical lines hidden, dark theme](docs/folded-dark.png)
+
+*Identical lines hidden, with three context lines around each change. The minimap shows the old file in the left half and the new file in the right half.*
 
 ## Requirements
 
