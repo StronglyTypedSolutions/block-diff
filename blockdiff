@@ -50,6 +50,7 @@ class FileDiff:
     a: list[str]
     b: list[str]
     binary: bool = False
+    disk: str | None = None  # The file on disk that an editor can open, if there is one.
     opcodes: list[tuple[str, int, int, int, int]] = field(default_factory=list)
 
 
@@ -100,6 +101,7 @@ def from_git(repo: str, old: str, new: str | None, paths: list[str]) -> list[Fil
             new_data = git_show(top, new, new_path)
         a, bin_a = to_lines(old_data)
         b, bin_b = to_lines(new_data)
+        disk = os.path.join(top, new_path)
         files.append(
             FileDiff(
                 status,
@@ -108,6 +110,7 @@ def from_git(repo: str, old: str, new: str | None, paths: list[str]) -> list[Fil
                 a,
                 b,
                 bin_a or bin_b,
+                disk if os.path.isfile(disk) else None,
             )
         )
     return files
@@ -136,6 +139,12 @@ def from_dirs(left: str, right: str) -> list[FileDiff]:
         status = "A" if old_data is None else "D" if new_data is None else "M"
         a, bin_a = to_lines(old_data)
         b, bin_b = to_lines(new_data)
+        # git difftool --dir-diff links working tree files into its temporary folder.
+        # realpath() gives the working tree file, which stays after the call.
+        # Other files in that folder are copies that git deletes after the call.
+        disk = os.path.realpath(os.path.join(right, rel))
+        if "/git-difftool." in disk:
+            disk = ""
         files.append(
             FileDiff(
                 status,
@@ -144,6 +153,7 @@ def from_dirs(left: str, right: str) -> list[FileDiff]:
                 a,
                 b,
                 bin_a or bin_b,
+                disk if os.path.isfile(disk) else None,
             )
         )
     return files
@@ -640,6 +650,7 @@ def build_payload(an: Analysis, title: str) -> dict:
                 "old": f.old_path,
                 "new": f.new_path,
                 "binary": f.binary,
+                "disk": f.disk,
                 "a": f.a,
                 "b": f.b,
                 "ca": "".join(ca),
@@ -718,7 +729,7 @@ try {
 :root {
   --bg: #ffffff; --fg: #1f2328; --dim: #8b949e; --panel: #f6f8fa; --line: #d0d7de;
   --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark-del: rgba(230, 40, 40, .30); --mark-add: rgba(20, 170, 60, .32); --strike: #c0262d;
-  --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2;
+  --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2; --cur: #cfe2ff;
   --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
   --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
   --syn-b: #8a4b08; --syn-f: #6a5300; --syn-d: #8a4b08;
@@ -731,7 +742,7 @@ try {
   :root:not([data-theme="light"]) {
     --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
     --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
-    --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
+    --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66;
     --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
     --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
     --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
@@ -741,7 +752,7 @@ try {
   color-scheme: dark;
   --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
   --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
-  --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
+  --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66;
   --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
   --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
   --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
@@ -761,8 +772,9 @@ header #summary { white-space: nowrap; }
 #files { grid-row: 2 / 4; overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
 .fi { padding: 4px 10px; cursor: pointer; border-left: 3px solid transparent; }
 .fi:hover { background: var(--sel); }
-.fi.cur { background: var(--sel); border-left-color: var(--chg-s); }
-.fi .nm { font-weight: 600; word-break: break-all; }
+.fi.cur, .fi.cur:hover { background: var(--cur); border-left: 4px solid var(--chg-s); padding-left: 9px; }
+.fi .nm { word-break: break-all; }
+.fi.cur .nm { font-weight: 700; }
 .fi .dir { color: var(--dim); font-size: 11px; word-break: break-all; }
 .fi .st { display: inline-block; width: 1.4em; font-weight: 700; }
 .fi .st.A { color: var(--add-s); } .fi .st.D { color: var(--del-s); }
@@ -1525,6 +1537,20 @@ document.addEventListener("keydown", e => {
   if (hit) { e.preventDefault(); hit[1](); }
 });
 
+// Open a file in VS Code at the first line that shows in the right pane.
+// The vscode:// link needs VS Code as the handler of that URL scheme.
+function openInEditor(i) {
+  const f = D.files[i];
+  let line = 1;
+  if (i === cur && LY) {
+    const j = LY.yb.findIndex(y => y * LH >= R.scrollTop);
+    if (j >= 0 && j < f.b.length) line = j + 1;
+  }
+  const a = document.createElement("a");
+  a.href = "vscode://file" + encodeURI(f.disk) + ":" + line;
+  a.click();
+}
+
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
@@ -1542,7 +1568,11 @@ document.addEventListener("keydown", e => {
       `<div class="dir">${esc(dir)}</div>` +
       `<div class="cnt"><span class="p">+${counts.a}</span> <span class="m">−${counts.d}</span>` +
       (counts.m ? ` · ${counts.m} moved/similar block ends` : "") + `</div>`;
-    el.addEventListener("click", () => showFile(i));
+    el.addEventListener("click", () => { if (i !== cur) showFile(i); });
+    if (f.disk) {
+      el.title = "Double-click to open in VS Code";
+      el.addEventListener("dblclick", () => openInEditor(i));
+    }
     list.appendChild(el);
   });
   const kinds = {moved: 0, similar: 0, reindent: 0};

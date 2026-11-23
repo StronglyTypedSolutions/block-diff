@@ -25,7 +25,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Detection of blocks that moved and changed. The tool merges the parts of an edited moved block into one block. A dashed band marks these blocks.
 - Clear labels: "moved", "moved, only indentation changed", or "moved with 2 changed lines". A marker at the left edge shows the changed lines in a moved block.
 - Word-level highlights in changed lines and in edited moved blocks. Removed words are red and struck through on the left. Added words are green on the right. The word diff runs over the whole changed block, so a reflowed comment marks only the words that really changed.
-- A flat list of all changed files.
+- A flat list of all changed files. The selected file has a blue background and a bold name. Double-click a file to open it in VS Code at the line that shows in the right pane.
 - Resizable panes: drag the middle bar to the left or right. Double-click it to restore the 50/50 split. The page remembers the split.
 - A minimap with the old file in the left half and the new file in the right half. You can click and drag it.
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
@@ -93,6 +93,10 @@ Two aliases make the daily use short:
 git config --global alias.bd '!blockdiff'                   # git bd main...HEAD
 git config --global alias.bdd 'difftool -d -t blockdiff'    # git bdd HEAD~1
 ```
+
+## Open files in VS Code
+
+A double-click on a file in the list opens a `vscode://file/...` link. VS Code installs the handler for these links. The first time, the browser asks if it can open the link. In revision mode, the link opens the file in the working tree. In folder mode, it opens the file in the right folder. Git difftool deletes its temporary copies after the call, so these files have no link. Working tree files in the difftool folder are links to the working tree, so these files keep their link.
 
 ## Settings
 
