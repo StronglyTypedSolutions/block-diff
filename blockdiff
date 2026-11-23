@@ -1127,7 +1127,7 @@ body.notes-on #notes { display: flex; }
 #notesbody { flex: 1; overflow: auto; padding: 2px 16px 16px; }
 #notesbody .none { color: var(--dim); font-style: italic; }
 .note + .note { border-top: 1px dashed var(--line); margin-top: 14px; }
-.md { max-width: 130ch; font-size: 13.5px; line-height: 1.5; }
+.md { font-size: 13.5px; line-height: 1.5; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 15px; margin: 12px 0 4px; }
 .md h1, .md h2 { font-size: 16px; }
 .md p, .md ul, .md ol { margin: 6px 0; }
