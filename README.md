@@ -24,7 +24,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Moved-block detection, also between files. Each moved block gets its own color, a connector band, and a link label such as "moved to line 229".
 - Detection of blocks that moved and changed. The tool merges the parts of an edited moved block into one block. A dashed band marks these blocks.
 - Clear labels: "moved", "moved, only indentation changed", or "moved with 2 changed lines". A marker at the left edge shows the changed lines in a moved block.
-- Word-level highlights in changed lines and in edited moved blocks. Removed words are red and struck through on the left. Added words are green on the right. The word diff runs over the whole changed block, so a reflowed comment marks only the words that really changed.
+- Word-level highlights in changed lines and in edited moved blocks. Removed words are red on the left. Added words are green on the right. The word diff runs over the whole changed block, so a reflowed comment marks only the words that really changed.
 - A flat list of all changed files. The selected file has a blue background and a bold name. Double-click a file to open it in VS Code at the line that shows in the right pane.
 - Resizable panes: drag the middle bar to the left or right. Double-click it to restore the 50/50 split. The page remembers the split.
 - A minimap with the old file in the left half and the new file in the right half. You can click and drag it.

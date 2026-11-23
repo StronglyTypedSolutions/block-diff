@@ -728,7 +728,7 @@ try {
 <style>
 :root {
   --bg: #ffffff; --fg: #1f2328; --dim: #8b949e; --panel: #f6f8fa; --line: #d0d7de;
-  --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark-del: rgba(230, 40, 40, .30); --mark-add: rgba(20, 170, 60, .32); --strike: #c0262d;
+  --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark-del: rgba(230, 40, 40, .30); --mark-add: rgba(20, 170, 60, .32);
   --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2; --cur: #cfe2ff;
   --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
   --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
@@ -741,7 +741,7 @@ try {
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
-    --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
+    --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30);
     --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66;
     --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
     --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
@@ -751,7 +751,7 @@ try {
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
-  --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
+  --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30);
   --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66;
   --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
   --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
@@ -807,10 +807,9 @@ header #summary { white-space: nowrap; }
 .kk { color: var(--syn-k); } .ks { color: var(--syn-s); } .kn { color: var(--syn-n); }
 .kc { color: var(--syn-c); font-style: italic; } .kb { color: var(--syn-b); }
 .kf { color: var(--syn-f); } .kd { color: var(--syn-d); }
-/* Word changes: removed words on the left (red, struck through), added words on the right (green). */
+/* Word changes: removed words on the left (red), added words on the right (green). */
 mark { color: inherit; border-radius: 2px; }
-#left mark { background: var(--mark-del); text-decoration: line-through; text-decoration-color: var(--strike);
-  text-decoration-thickness: 1.5px; }
+#left mark { background: var(--mark-del); }
 #right mark { background: var(--mark-add); }
 /* Sticky: the label stays visible at the right edge, also after a long line. */
 .tag { position: sticky; right: 6px; display: inline-block; line-height: 17px; margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
