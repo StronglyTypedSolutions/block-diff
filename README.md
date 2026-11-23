@@ -122,6 +122,10 @@ blockdiff main...HEAD --notes review.md
 - The "Report overview" button shows the start of the report, and the notes that match no change.
 - Drag the top edge of the panel to change its height. Press `r` to hide or show the panel.
 
+![The note of the selected change under the panes, dark theme](docs/review-notes-dark.png)
+
+*The new method `_set_layout` is selected. Its line numbers are highlighted, and the panel shows its note with the risk class from the report.*
+
 The report is Markdown with this convention:
 
 - A heading with the file path in backticks starts the notes of that file, for example ``### 3.1 `source/pkg/module.py` ``. The path can be the full path or its end.
