@@ -250,6 +250,73 @@ def change_spans(x: str, y: str) -> tuple[list[list[int]], list[list[int]]]:
     return sx, sy
 
 
+BLOCK_TOKEN_LIMIT = 3000  # Above this size, block_spans() pairs lines instead.
+
+
+def block_spans(xs: list[str], ys: list[str]) -> tuple[list[list[list[int]]], list[list[list[int]]]]:
+    """Return the character ranges that differ between two blocks of lines.
+
+    The diff runs over the words of the whole block, so text that moved to another line
+    (for example a reflowed comment) stays unmarked. Whitespace and the "#" at the start
+    of a comment line do not count.
+    The result has one list of ranges for each line.
+    """
+    def words(lines: list[str]) -> list[tuple[int, int, int, str]]:
+        out = []
+        for li, line in enumerate(lines):
+            pos = 0
+            for t in SPAN_TOKEN_RE.findall(line):
+                # Skip whitespace and a leading comment "#": they only show the layout.
+                if not t.isspace() and not (t == "#" and not line[:pos].strip()):
+                    out.append((li, pos, pos + len(t), t))
+                pos += len(t)
+        return out
+
+    wx, wy = words(xs), words(ys)
+    sx: list[list[list[int]]] = [[] for _ in xs]
+    sy: list[list[list[int]]] = [[] for _ in ys]
+    if len(wx) > BLOCK_TOKEN_LIMIT or len(wy) > BLOCK_TOKEN_LIMIT:
+        return pair_spans(xs, ys)
+    ops = difflib.SequenceMatcher(None, [w[3] for w in wx], [w[3] for w in wy], autojunk=False).get_opcodes()
+    # One equal word between two changes is mostly chance ("the", "only", "."). Count it as changed.
+    for k in range(1, len(ops) - 1):
+        tag, i1, i2, j1, j2 = ops[k]
+        if tag == "equal" and i2 - i1 == 1 and ops[k - 1][0] != "equal" and ops[k + 1][0] != "equal":
+            ops[k] = ("replace", i1, i2, j1, j2)
+
+    def mark(ws: list[tuple[int, int, int, str]], out: list[list[list[int]]], lines: list[str]) -> None:
+        for li, a, b, _ in ws:
+            spans = out[li]
+            # Join with the previous range when only whitespace separates them.
+            if spans and not lines[li][spans[-1][1] : a].strip():
+                spans[-1][1] = b
+            else:
+                spans.append([a, b])
+
+    for tag, i1, i2, j1, j2 in ops:
+        if tag != "equal":
+            mark(wx[i1:i2], sx, xs)
+            mark(wy[j1:j2], sy, ys)
+    return sx, sy
+
+
+def pair_spans(xs: list[str], ys: list[str]) -> tuple[list[list[list[int]]], list[list[list[int]]]]:
+    """Pair similar lines in order and compare each pair. Unpaired lines are marked in full."""
+    sx: list[list[list[int]]] = [[[0, len(x)]] if x.strip() else [] for x in xs]
+    sy: list[list[list[int]]] = [[[0, len(y)]] if y.strip() else [] for y in ys]
+    ptr = 0
+    for i, x in enumerate(xs):
+        best, best_j = SIM_LINE, -1
+        for jj in range(ptr, min(ptr + 8, len(ys))):
+            r = difflib.SequenceMatcher(None, x, ys[jj], autojunk=False).ratio()
+            if r > best:
+                best, best_j = r, jj
+        if best_j >= 0:
+            sx[i], sy[best_j] = change_spans(x, ys[best_j])
+            ptr = best_j + 1
+    return sx, sy
+
+
 @dataclass
 class Move:
     kind: str  # "moved", "similar", or "reindent"
@@ -554,20 +621,13 @@ def build_payload(an: Analysis, title: str) -> dict:
             for j in range(j1, j2):
                 cb[j] = "e" if t == "e" else ("a" if t == "a" else "c")
             if tag == "replace":
-                # Pair the changed lines in order to highlight changes inside lines.
+                # Mark the removed and added words. Moved lines get their own marks.
                 olds = [i for i in range(i1, i2) if move_a[fi][i] < 0]
                 news = [j for j in range(j1, j2) if move_b[fi][j] < 0]
-                ptr = 0
-                for i in olds:
-                    best, best_j = SIM_LINE, -1
-                    for jj in range(ptr, min(ptr + 8, len(news))):
-                        r = difflib.SequenceMatcher(None, f.a[i], f.b[news[jj]], autojunk=False).ratio()
-                        if r > best:
-                            best, best_j = r, jj
-                    if best_j >= 0:
-                        x, y = change_spans(f.a[i], f.b[news[best_j]])
-                        sa[i], sb[news[best_j]] = x, y
-                        ptr = best_j + 1
+                if olds and news:
+                    xs, ys = block_spans([f.a[i] for i in olds], [f.b[j] for j in news])
+                    sa.update({i: x for i, x in zip(olds, xs) if x})
+                    sb.update({j: y for j, y in zip(news, ys) if y})
         for i, mid in enumerate(move_a[fi]):
             if mid >= 0:
                 ca[i] = KIND_CLASS[an.moves[mid].kind]
@@ -623,12 +683,13 @@ def build_payload(an: Analysis, title: str) -> dict:
                     cb[m.dj + j] = KIND_CLASS["similar"]
                 if tag != "replace":
                     continue
-                for k in range(min(i2 - i1, j2 - j1)):
-                    x, y = xa[i1 + k], yb[j1 + k]
-                    if norm(x) and norm(y):
-                        sx, sy = change_spans(x, y)
-                        out_files[m.sf]["sa"][m.si + i1 + k] = sx
-                        out_files[m.df]["sb"][m.dj + j1 + k] = sy
+                xs, ys = block_spans(xa[i1:i2], yb[j1:j2])
+                for k, x in enumerate(xs):
+                    if x:
+                        out_files[m.sf]["sa"][m.si + i1 + k] = x
+                for k, y in enumerate(ys):
+                    if y:
+                        out_files[m.df]["sb"][m.dj + j1 + k] = y
         changed_counts.append(changed)
         out_files[m.sf]["ma"].append([m.si, m.na, mid])
         out_files[m.df]["mb"].append([m.dj, m.nb, mid])
@@ -656,7 +717,7 @@ try {
 <style>
 :root {
   --bg: #ffffff; --fg: #1f2328; --dim: #8b949e; --panel: #f6f8fa; --line: #d0d7de;
-  --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark: rgba(255, 170, 0, .45);
+  --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark-del: rgba(230, 40, 40, .30); --mark-add: rgba(20, 170, 60, .32); --strike: #c0262d;
   --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2;
   --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
   --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
@@ -669,7 +730,7 @@ try {
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
-    --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark: rgba(255, 170, 0, .35);
+    --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
     --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
     --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
     --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
@@ -679,7 +740,7 @@ try {
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
-  --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark: rgba(255, 170, 0, .35);
+  --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30); --strike: #ff8a8a;
   --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d;
   --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
   --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
@@ -734,7 +795,11 @@ header #summary { white-space: nowrap; }
 .kk { color: var(--syn-k); } .ks { color: var(--syn-s); } .kn { color: var(--syn-n); }
 .kc { color: var(--syn-c); font-style: italic; } .kb { color: var(--syn-b); }
 .kf { color: var(--syn-f); } .kd { color: var(--syn-d); }
-mark { background: var(--mark); color: inherit; border-radius: 2px; }
+/* Word changes: removed words on the left (red, struck through), added words on the right (green). */
+mark { color: inherit; border-radius: 2px; }
+#left mark { background: var(--mark-del); text-decoration: line-through; text-decoration-color: var(--strike);
+  text-decoration-thickness: 1.5px; }
+#right mark { background: var(--mark-add); }
 /* Sticky: the label stays visible at the right edge, also after a long line. */
 .tag { position: sticky; right: 6px; display: inline-block; line-height: 17px; margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
   color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
