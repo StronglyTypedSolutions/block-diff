@@ -1117,6 +1117,10 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
   height: var(--notesh, 32vh); border-top: 1px solid var(--line); background: var(--bg); }
 body.notes-on #notes { display: flex; }
 #notes .grip { position: absolute; left: 0; right: 0; top: -4px; height: 8px; z-index: 3; cursor: row-resize; touch-action: none; }
+#notes .lgrip { position: absolute; top: 0; bottom: 0; left: -4px; width: 8px; z-index: 4; cursor: col-resize; touch-action: none; }
+/* The left edge can move to the right. Under the right pane, the panel follows the middle bar. */
+#notes.inset { border-left: 1px solid var(--line); }
+#notes.under-right { grid-column: 4 / -1; margin-left: 0 !important; }
 #notes .bar { display: flex; gap: 10px; align-items: center; padding: 4px 12px; font-size: 12px;
   background: var(--panel); border-bottom: 1px solid var(--line); white-space: nowrap; }
 #notestitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
@@ -1165,6 +1169,7 @@ body.notes-on #notes { display: flex; }
   <div class="pane" id="right"><div class="content" id="rc"></div></div>
   <div id="ov"></div>
   <div id="notes"><div class="grip" title="Drag to resize"></div>
+    <div class="lgrip" title="Drag to move the left edge. Drop it at the right pane to keep the notes under that pane. Double-click: full width."></div>
     <div class="bar"><span id="notestitle"></span><span id="notescount"></span>
       <button id="ovbtn" aria-pressed="false" title="Show the start of the report and the notes that match no change">Report overview</button></div>
     <div id="notesbody"></div></div>
@@ -2062,16 +2067,51 @@ function setNotesHeight(px, save = true) {
   grip.addEventListener("pointercancel", end);
 }
 
+// Drag the left edge of the panel to the right. The value is "right" (under the right
+// pane, so it follows the middle bar) or a fraction of the width under the panes.
+const NOTES_EL = document.getElementById("notes"), NOTES_SNAP = 12, NOTES_LEFT_MAX = 0.8;
+function setNotesLeft(x, save = true) {
+  if (x !== "right") x = Math.min(Math.max(+x || 0, 0), NOTES_LEFT_MAX);
+  NOTES_EL.classList.toggle("under-right", x === "right");
+  NOTES_EL.classList.toggle("inset", x === "right" || x > 0);
+  NOTES_EL.style.marginLeft = x === "right" ? "" : x * 100 + "%";
+  if (save) try { localStorage.setItem("blockdiff.notesl", String(x)); } catch (e) { /* storage unavailable */ }
+}
+{
+  const grip = NOTES_EL.querySelector(".lgrip");
+  let dragging = false, last = 0;
+  grip.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    dragging = true;
+    try { grip.setPointerCapture(e.pointerId); } catch (err) { /* synthetic event */ }
+  });
+  grip.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    const x0 = L.getBoundingClientRect().left, w = document.getElementById("app").getBoundingClientRect().right - x0;
+    const rx = R.getBoundingClientRect().left;
+    if (Math.abs(e.clientX - rx) < NOTES_SNAP) last = "right";
+    else if (e.clientX - x0 < NOTES_SNAP) last = 0;
+    else last = (e.clientX - x0) / w;
+    setNotesLeft(last, false);
+  });
+  const end = () => { if (dragging) { dragging = false; setNotesLeft(last); } };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+  grip.addEventListener("dblclick", () => setNotesLeft(0));
+}
+
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
   if (D.review) {
-    let on = true, h = NaN;
+    let on = true, h = NaN, left = null;
     try {
       on = localStorage.getItem("blockdiff.notes") !== "0";
       h = parseFloat(localStorage.getItem("blockdiff.notesh"));
+      left = localStorage.getItem("blockdiff.notesl");
     } catch (e) { /* storage unavailable */ }
     if (h > 0) setNotesHeight(h, false);
+    if (left) setNotesLeft(left === "right" ? "right" : parseFloat(left), false);
     showNotes(on, false);
     document.getElementById("notesbtn").hidden = false;
     document.getElementById("rhelp").hidden = false;

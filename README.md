@@ -121,6 +121,7 @@ blockdiff main...HEAD --notes review.md
 - If one change overlaps several notes, the panel shows all of them.
 - The "Report overview" button shows the start of the report, and the notes that match no change.
 - Drag the top edge of the panel to change its height. Press `r` to hide or show the panel.
+- Drag the left edge of the panel to the right to make room under the left pane. Drop it at the left edge of the right pane to keep the panel under the right pane, also when you move the middle bar. Double-click the left edge to restore the full width.
 
 ![The note of the selected change under the panes, dark theme](docs/review-notes-dark.png)
 
@@ -140,7 +141,7 @@ A double-click on a file in the list opens a `vscode://file/...` link. VS Code i
 
 ## Settings
 
-The page keeps the "hide identical lines", theme, pane split, and notes panel settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
+The page keeps the "hide identical lines", theme, pane split, and notes panel settings (shown, height, left edge) in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
 
 The code uses JetBrains Mono at 14 px with a 20 px line height if the font is installed. Otherwise it uses the default monospace font.
 
