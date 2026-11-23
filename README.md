@@ -104,7 +104,7 @@ If the GitHub CLI (`gh`) finds a pull request for the current branch, the line n
 - Shift+click a second line number on the same side to open the range between the two lines.
 - To write the comment, click the "+" next to the line on GitHub. GitHub has no link that opens the comment box directly.
 
-All clicks reuse one browser tab. GitHub can only show lines in the diff of the pull request, and only lines in or near a change accept comments. If your diff differs from the pull request diff, for example because of uncommitted changes, the line numbers can differ too.
+Log in to GitHub first. Without a login, GitHub opens the page but does not scroll to the line. All clicks reuse one browser tab. GitHub can only show lines in the diff of the pull request, and only lines in or near a change accept comments. If your diff differs from the pull request diff, for example because of uncommitted changes, the line numbers can differ too.
 
 ## Open files in VS Code
 
