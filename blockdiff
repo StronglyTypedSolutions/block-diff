@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["markdown-it-py>=3"]
+# ///
 """blockdiff: side-by-side diff with moved-block and similar-block detection.
 
 The tool writes one self-contained HTML file (inline SVG connectors and JavaScript
@@ -18,6 +22,7 @@ import argparse
 import builtins
 import difflib
 import hashlib
+import html
 import io
 import keyword
 import json
@@ -636,6 +641,221 @@ def finish_pr_lookup(proc: subprocess.Popen | None) -> dict | None:
     return {"number": info["number"], "url": info["url"]}
 
 
+# -------------------------------------------------------------------- review notes
+# A review report is a Markdown file with one note per hunk. The convention:
+# - A heading with the file path in backticks starts the notes of that file.
+# - Each note is a section under that heading that contains a ```diff fence with the hunk.
+# - "**Risk: High**", "Medium" or "Low" in a note gives its risk class.
+# The fence anchors the note by content, not by the @@ line numbers, so a note still finds
+# its lines after a rebase. A note marks the changed lines of its hunk on both sides.
+RISK_RE = re.compile(r"\*\*Risk:\s*(High|Medium|Low)\b", re.IGNORECASE)
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+MIN_ANCHOR_CHARS = 6  # Shorter lines, such as ")" or "", give no vote in the fuzzy search.
+
+
+def markdown_renderer():
+    """A CommonMark renderer with tables. Raw HTML in the report shows as text."""
+    from markdown_it import MarkdownIt
+
+    md = MarkdownIt("commonmark", {"html": False}).enable("table")
+    default_fence = md.renderer.rules["fence"]
+
+    def fence(tokens, idx, options, env):
+        tok = tokens[idx]
+        if tok.info.strip().split()[:1] != ["diff"]:
+            return default_fence(tokens, idx, options, env)
+        # The panes show the hunk already, so the copy in the note starts collapsed.
+        rows = []
+        for line in tok.content.rstrip("\n").split("\n"):
+            cls = {"+": "da", "-": "dd", "@": "dh"}.get(line[:1], "")
+            rows.append(f'<span class="{cls}">{html.escape(line)}</span>' if cls else html.escape(line))
+        return f'<details class="hunk"><summary>Hunk in the report</summary><pre>{chr(10).join(rows)}</pre></details>\n'
+
+    md.renderer.rules["fence"] = fence
+    return md
+
+
+def parse_hunks(content: str) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    """Split a diff fence into hunks: (old start, new start, [(op, text)]). The starts are hints."""
+    hunks: list[tuple[int, int, list[tuple[str, str]]]] = []
+    for line in content.split("\n"):
+        m = HUNK_RE.match(line)
+        if m:
+            hunks.append((int(m.group(1)), int(m.group(2)), []))
+            continue
+        if line.startswith(("diff --git", "index ", "--- ", "+++ ", "\\")):
+            continue
+        if not hunks:
+            hunks.append((0, 0, []))
+        if line[:1] in ("+", "-", " "):
+            hunks[-1][2].append((line[0], line[1:]))
+        else:  # An empty context line: the generator dropped its leading space.
+            hunks[-1][2].append((" ", line))
+    while hunks and hunks[-1][2] and hunks[-1][2][-1] == (" ", ""):
+        hunks[-1][2].pop()  # The empty last line of the fence.
+    return [h for h in hunks if h[2]]
+
+
+def anchor(seq: list[str], marks: list[int], target: list[str], hint: int) -> tuple[list[int], bool]:
+    """Find the lines "seq" in "target", near line "hint". Return the target lines of the
+    entries "marks" of "seq", and whether the match is exact."""
+    if not seq or not marks:
+        return [], True
+    key = [s.rstrip() for s in seq]
+    tgt = [t.rstrip() for t in target]
+    n = len(key)
+    exact = [s for s in range(len(tgt) - n + 1) if tgt[s] == key[0] and tgt[s : s + n] == key]
+    if exact:
+        s = min(exact, key=lambda s: abs(s - hint))
+        return [s + k for k in marks], True
+    # Fuzzy: each distinct long line votes for an offset. The offset with the most votes wins.
+    where: dict[str, list[int]] = {}
+    for i, t in enumerate(tgt):
+        if len(t.strip()) >= MIN_ANCHOR_CHARS:
+            where.setdefault(t, []).append(i)
+    votes: dict[int, int] = {}
+    for k, s in enumerate(key):
+        hits = where.get(s, [])
+        if 0 < len(hits) <= 8:
+            for p in hits:
+                votes[p - k] = votes.get(p - k, 0) + 1
+    if not votes:
+        return [], False
+    best = max(votes.values())
+    if best < 2 and len(seq) > 2:
+        return [], False
+    off = min((o for o, v in votes.items() if v == best), key=lambda o: abs(o - hint))
+    out = []
+    for k in marks:
+        p = off + k
+        if not (0 <= p < len(tgt) and tgt[p] == key[k]):
+            # Lines added or removed since the report shift the line. Look nearby.
+            near = [q for q in range(max(0, p - 12), min(len(tgt), p + 13)) if tgt[q] == key[k]]
+            if not near:
+                continue  # The line is not in the file: do not mark another line.
+            p = min(near, key=lambda q: abs(q - p))
+        out.append(p)
+    return out, False
+
+
+def to_ranges(lines: list[int]) -> list[list[int]]:
+    out: list[list[int]] = []
+    for i in sorted(set(lines)):
+        if out and out[-1][1] == i:
+            out[-1][1] = i + 1
+        else:
+            out.append([i, i + 1])
+    return out
+
+
+def match_file(text: str, files: list[FileDiff]) -> int:
+    """The index of the changed file that a heading names in backticks, or -1."""
+    best, best_score = -1, 0
+    for name in re.findall(r"`([^`\n]+)`", text):
+        name = name.strip().removeprefix("./")
+        for k, f in enumerate(files):
+            for p in (f.new_path, f.old_path):
+                # Exact, then a path that ends with the name, then a name that ends with the
+                # path (with --dirs, the paths are relative to the folders).
+                score = 3 if p == name else 2 if p and p.endswith("/" + name) else 1 if p and name.endswith("/" + p) else 0
+                if score > best_score:
+                    best, best_score = k, score
+    return best
+
+
+def load_notes(path: str, files: list[FileDiff]) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    lines = text.split("\n")
+    md = markdown_renderer()
+    tokens = md.parse(text)
+    heads = []  # (first line, level, text)
+    fences = []  # (first line, content)
+    for k, tok in enumerate(tokens):
+        if tok.type == "heading_open" and tok.map:
+            heads.append((tok.map[0], int(tok.tag[1]), tokens[k + 1].content))
+        elif tok.type == "fence" and tok.map and tok.info.strip().split()[:1] == ["diff"]:
+            fences.append((tok.map[0], tok.content))
+    ends = []
+    for k, (line, level, _t) in enumerate(heads):
+        nxt = next((h[0] for h in heads[k + 1 :] if h[1] <= level), len(lines))
+        ends.append(nxt)
+    file_of = [match_file(t, files) for _l, _v, t in heads]
+    render = lambda a, b: md.render("\n".join(lines[a:b]))  # noqa: E731
+
+    def ancestors(line: int) -> list[int]:
+        return [k for k, h in enumerate(heads) if h[0] <= line < ends[k]]
+
+    # Group the fences by their note: the deepest heading below the file heading.
+    groups: dict[tuple[int, int, int], list[str]] = {}
+    for line, content in fences:
+        anc = ancestors(line)
+        fh_ = next((k for k in reversed(anc) if file_of[k] >= 0), -1)
+        fi = file_of[fh_] if fh_ >= 0 else -1
+        m = re.search(r"^\+\+\+ (?:b/)?(\S+)", content, re.MULTILINE)
+        if m:  # A full diff in the fence names its own file.
+            fi = match_file(f"`{m.group(1)}`", files)
+        inner = [k for k in anc if fh_ < 0 or heads[k][1] > heads[fh_][1]]
+        if inner and (fh_ < 0 or inner[-1] > fh_):
+            start, end = heads[inner[-1]][0], ends[inner[-1]]
+        else:  # No heading of its own: the note runs to the next fence or heading.
+            start = line
+            end = min([h[0] for h in heads if h[0] > line] + [f[0] for f in fences if f[0] > line] + [len(lines)])
+        groups.setdefault((start, end, fi), []).append(content)
+
+    notes, unmatched = [], []
+    for (start, end, fi), contents in sorted(groups.items()):
+        title = next((h[2] for h in heads if h[0] == start), f"Note at line {start + 1}")
+        risk = RISK_RE.search("\n".join(lines[start:end]))
+        a_lines: list[int] = []
+        b_lines: list[int] = []
+        exact = True
+        if fi >= 0:
+            f = files[fi]
+            for content in contents:
+                for old_start, new_start, ops in parse_hunks(content):
+                    for side, keep, mark, target, hint, out in (
+                        ("a", " -", "-", f.a, old_start - 1, a_lines),
+                        ("b", " +", "+", f.b, new_start - 1, b_lines),
+                    ):
+                        seq = [t for op, t in ops if op in keep]
+                        marks = [k for k, (op, _t) in enumerate((o for o in ops if o[0] in keep)) if op == mark]
+                        if not marks and side == "b" and not any(op == "-" for op, _t in ops):
+                            marks = list(range(len(seq)))  # Context only: mark all of it.
+                        got, ok = anchor(seq, marks, target, hint)
+                        out.extend(got)
+                        exact = exact and ok and len(got) == len(marks)
+        note = {
+            "title": title,
+            "risk": risk.group(1).capitalize() if risk else None,
+            "html": render(start, end),
+            "file": fi,
+            "a": to_ranges(a_lines),
+            "b": to_ranges(b_lines),
+            "exact": exact,
+        }
+        if fi < 0 or not (a_lines or b_lines):
+            unmatched.append(title)
+            note["file"] = -1
+        notes.append(note)
+
+    first_file = min((h[0] for k, h in enumerate(heads) if file_of[k] >= 0), default=len(lines))
+    intros = {}
+    for k, (line, _level, _t) in enumerate(heads):
+        fi = file_of[k]
+        if fi < 0 or str(fi) in intros:
+            continue
+        stop = min([h[0] for h in heads if h[0] > line] + [f[0] for f in fences if f[0] > line] + [ends[k]])
+        intros[str(fi)] = render(line, stop)
+    return {
+        "name": os.path.basename(path),
+        "overview": render(0, first_file),
+        "intros": intros,
+        "notes": notes,
+        "unmatched": unmatched,
+    }
+
+
 def build_payload(an: Analysis, title: str) -> dict:
     files = an.files
     move_a = [[-1] * len(f.a) for f in files]
@@ -760,7 +980,7 @@ try {
 :root {
   --bg: #ffffff; --fg: #1f2328; --dim: #8b949e; --panel: #f6f8fa; --line: #d0d7de;
   --del: #ffd5d1; --add: #ccf5d5; --chg: #d3e8ff; --mark-del: rgba(230, 40, 40, .30); --mark-add: rgba(20, 170, 60, .32);
-  --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2; --cur: #cfe2ff; --pv: rgba(0, 0, 0, .14); --pv-edge: rgba(0, 0, 0, .45);
+  --del-s: #d1242f; --add-s: #1a7f37; --chg-s: #0969da; --sel: #eaeef2; --cur: #cfe2ff; --risk-m: #9a6700; --pv: rgba(0, 0, 0, .14); --pv-edge: rgba(0, 0, 0, .45);
   --mv-l: 85%; --mv-s: 75%; --tag-l: 40%;
   --syn-k: #7a3db8; --syn-s: #0b4f8a; --syn-c: #6e7781; --syn-n: #0b6e6e;
   --syn-b: #8a4b08; --syn-f: #6a5300; --syn-d: #8a4b08;
@@ -773,7 +993,7 @@ try {
   :root:not([data-theme="light"]) {
     --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
     --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30);
-    --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66; --pv: rgba(255, 255, 255, .18); --pv-edge: rgba(255, 255, 255, .6);
+    --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66; --risk-m: #d29922; --pv: rgba(255, 255, 255, .18); --pv-edge: rgba(255, 255, 255, .6);
     --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
     --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
     --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
@@ -783,7 +1003,7 @@ try {
   color-scheme: dark;
   --bg: #0d1117; --fg: #e6edf3; --dim: #7d8590; --panel: #161b22; --line: #30363d;
   --del: #3c1618; --add: #12301c; --chg: #0f2a45; --mark-del: rgba(255, 70, 70, .38); --mark-add: rgba(60, 220, 110, .30);
-  --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66; --pv: rgba(255, 255, 255, .18); --pv-edge: rgba(255, 255, 255, .6);
+  --del-s: #f85149; --add-s: #3fb950; --chg-s: #4493f8; --sel: #21262d; --cur: #1d3b66; --risk-m: #d29922; --pv: rgba(255, 255, 255, .18); --pv-edge: rgba(255, 255, 255, .6);
   --mv-l: 22%; --mv-s: 45%; --tag-l: 45%;
   --syn-k: #e3c8ff; --syn-s: #ffd9bf; --syn-c: #9aa7b4; --syn-n: #d6f0c4;
   --syn-b: #b9f0e6; --syn-f: #fff1a8; --syn-d: #ffe0a3;
@@ -793,14 +1013,14 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
   font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
 #app { display: grid; height: 100vh;
   grid-template-columns: 300px minmax(0, var(--lfr, 1fr)) 128px minmax(0, var(--rfr, 1fr)) 42px;
-  grid-template-rows: auto auto minmax(0, 1fr); }
+  grid-template-rows: auto auto minmax(0, 1fr) auto; }
 header { grid-column: 1 / -1; display: flex; gap: 16px; align-items: baseline;
   padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header b { font-size: 14px; }
 header .help { margin-left: auto; min-width: 0; color: var(--dim); font-size: 12px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 header #summary { white-space: nowrap; }
-#files { grid-row: 2 / 4; overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
+#files { grid-row: 2 / -1; overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
 .fi { padding: 4px 10px; cursor: pointer; border-left: 3px solid transparent; }
 .fi:hover { background: var(--sel); }
 .fi.cur, .fi.cur:hover { background: var(--cur); border-left: 4px solid var(--chg-s); padding-left: 9px; }
@@ -892,6 +1112,42 @@ mark { color: inherit; border-radius: 2px; }
 header button { white-space: nowrap; font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 header button[aria-pressed="true"] { background: var(--chg); border-color: var(--chg-s); }
+/* Review notes: a panel under the panes with the note of the selected change. */
+#notes { grid-column: 2 / -1; display: none; flex-direction: column; position: relative; min-height: 0;
+  height: var(--notesh, 32vh); border-top: 1px solid var(--line); background: var(--bg); }
+body.notes-on #notes { display: flex; }
+#notes .grip { position: absolute; left: 0; right: 0; top: -4px; height: 8px; z-index: 3; cursor: row-resize; touch-action: none; }
+#notes .bar { display: flex; gap: 10px; align-items: center; padding: 4px 12px; font-size: 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line); white-space: nowrap; }
+#notestitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+#notescount { margin-left: auto; color: var(--dim); }
+#notes button { font: inherit; padding: 1px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#notes button[aria-pressed="true"] { background: var(--chg); border-color: var(--chg-s); }
+#notesbody { flex: 1; overflow: auto; padding: 2px 16px 16px; }
+#notesbody .none { color: var(--dim); font-style: italic; }
+.note + .note { border-top: 1px dashed var(--line); margin-top: 14px; }
+.md { max-width: 130ch; font-size: 13.5px; line-height: 1.5; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 15px; margin: 12px 0 4px; }
+.md h1, .md h2 { font-size: 16px; }
+.md p, .md ul, .md ol { margin: 6px 0; }
+.md code { font: 12.5px "JetBrains Mono", monospace; background: var(--panel); padding: 0 3px; border-radius: 3px; }
+.md pre { background: var(--panel); padding: 8px 10px; overflow: auto; font: 12.5px/1.45 "JetBrains Mono", monospace; border-radius: 4px; }
+.md pre code { background: none; padding: 0; }
+.md table { border-collapse: collapse; margin: 6px 0; }
+.md th, .md td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--panel); }
+.md a { color: var(--chg-s); }
+.md details.hunk { margin: 6px 0; }
+.md details.hunk summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+.md .da { color: var(--add-s); } .md .dd { color: var(--del-s); } .md .dh { color: var(--chg-s); }
+.risk { display: inline-block; margin-left: 6px; padding: 0 7px; border-radius: 9px; font-size: 11px; font-weight: 700;
+  line-height: 16px; border: 1px solid currentColor; }
+.risk.High { color: var(--del-s); } .risk.Medium { color: var(--risk-m); } .risk.Low { color: var(--dim); }
+.fuzzy { color: var(--risk-m); font-weight: 400; margin-left: 6px; }
+/* The selected change: its line numbers and its band in the gutter. */
+.r.selr .n { background: var(--cur); color: var(--fg); font-weight: 700; }
+#gutter g.sel .edge { stroke-width: 2.5; }
 .binary { padding: 20px; color: var(--dim); }
 </style>
 </head>
@@ -899,14 +1155,19 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
 <div id="app">
   <header><b>blockdiff</b><span id="summary"></span><a id="prlink" target="blockdiff-pr" hidden></a>
     <button id="themebtn" title="Theme: system, dark, or light (t)">System theme (t)</button>
+    <button id="notesbtn" aria-pressed="true" title="Show or hide the review notes (r)" hidden>Notes (r)</button>
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
-    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme</span></header>
+    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme<span id="rhelp" hidden> &nbsp; r: notes</span></span></header>
   <div id="files"></div>
   <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rtitle"></div><div class="otitle"></div>
   <div class="pane" id="left"><div class="content" id="lc"></div></div>
   <svg id="gutter"></svg>
   <div class="pane" id="right"><div class="content" id="rc"></div></div>
   <div id="ov"></div>
+  <div id="notes"><div class="grip" title="Drag to resize"></div>
+    <div class="bar"><span id="notestitle"></span><span id="notescount"></span>
+      <button id="ovbtn" aria-pressed="false" title="Show the start of the report and the notes that match no change">Report overview</button></div>
+    <div id="notesbody"></div></div>
 </div>
 <script id="data" type="application/json">__DATA__</script>
 <script>
@@ -1080,6 +1341,8 @@ function render() {
   }
   buildVirtual();
   buildOverview(f);
+  sel = -1;
+  updateNotes();
 }
 
 function showFile(i, scrollToFirst = true) {
@@ -1401,12 +1664,12 @@ function draw() {
   if (!LY) return;
   const W = G.clientWidth, H = G.clientHeight, lt = L.scrollTop, rt = R.scrollTop;
   let s = "";
-  for (const [t, a1r, a2r, b1r, b2r] of LY.dops) {
-    if (t === "e") continue;
+  LY.dops.forEach(([t, a1r, a2r, b1r, b2r], k) => {
+    if (t === "e") return;
     const a1 = a1r * LH - lt, a2 = a2r * LH - lt, b1 = b1r * LH - rt, b2 = b2r * LH - rt;
-    if (Math.max(a2, b2) < 0 || Math.min(a1, b1) > H) continue;
-    s += bandGroup(`class="${t}" data-ra="${a1r}" data-rb="${b1r}"`, a1, a2, b1, b2, W);
-  }
+    if (Math.max(a2, b2) < 0 || Math.min(a1, b1) > H) return;
+    s += bandGroup(`class="${t}${k === sel ? " sel" : ""}" data-k="${k}" data-ra="${a1r}" data-rb="${b1r}"`, a1, a2, b1, b2, W);
+  });
   D.moves.forEach(([kind, sf, si, df, dj, na, nb], mid) => {
     if (sf !== cur || df !== cur) return;
     const a1 = LY.ya[si] * LH - lt, a2 = LY.ya[si + na] * LH - lt;
@@ -1418,6 +1681,7 @@ function draw() {
   });
   G.innerHTML = s;
   updateThumb();
+  autoSelect();
 }
 
 for (const pane of [L, R]) {
@@ -1438,11 +1702,19 @@ for (const pane of [L, R]) {
     if (num && D.pr) return openPrLine(pane === L ? "a" : "b", +num.parentElement.dataset.i, e.shiftKey, num);
     const fold = e.target.closest(".r.fold");
     if (fold) return openFold(fold, pane);
+    const line = e.target.closest(".r[data-i]");
+    if (line && D.review) {
+      const side = pane === L ? "a" : "b", i = +line.dataset.i;
+      const k = blockAt((side === "a" ? LY.ya : LY.yb)[i], side);
+      if (k >= 0) select(k);
+    }
     const row = e.target.closest(".r[data-m]");
     if (row) goToCounterpart(+row.dataset.m, pane === L ? "a" : "b");
   });
 }
-window.addEventListener("resize", () => applyV(vNow));
+// The panes change size with the window, the split and the notes panel. The thumb and
+// the alignment depend on the pane height, so recompute the positions.
+new ResizeObserver(() => { if (LY) applyV(vNow); }).observe(L);
 
 // Drag the gutter to the left or right to resize the panes. Double-click resets the split.
 // A drag starts only after a few pixels, so a click on a band still aligns it.
@@ -1503,8 +1775,10 @@ G.addEventListener("click", e => {
     alignRows(LY.ya[si], LY.yb[dj]);
     flash(L, si, na);
     flash(R, dj, nb);
+    if (sf === cur) select(blockAt(LY.ya[si], "a"));
   } else if (path.dataset.ra !== undefined) {
     alignRows(+path.dataset.ra, +path.dataset.rb);
+    select(+path.dataset.k);
   }
 });
 
@@ -1588,9 +1862,9 @@ function goToCounterpart(mid, side) {
 function jumpChange(dir) {
   const now = animating ? vTarget : vNow;
   const starts = [];
-  LY.dops.forEach((o, k) => { if (o[0] !== "e" && o[0] !== "f") starts.push(clampV(LY.dv[k] - CONTEXT_ABOVE)); });
-  const v = dir > 0 ? starts.find(s => s > now + 0.5) : starts.slice().reverse().find(s => s < now - 0.5);
-  if (v !== undefined) scrollToV(v);
+  LY.dops.forEach((o, k) => { if (o[0] !== "e" && o[0] !== "f") starts.push([clampV(LY.dv[k] - CONTEXT_ABOVE), k]); });
+  const hit = dir > 0 ? starts.find(([s]) => s > now + 0.5) : starts.slice().reverse().find(([s]) => s < now - 0.5);
+  if (hit) { scrollToV(hit[0]); select(hit[1]); }
   else if (dir > 0 && cur < D.files.length - 1) showFile(cur + 1);
   else if (dir < 0 && cur > 0) showFile(cur - 1);
 }
@@ -1616,6 +1890,7 @@ const KEYS = [
   [e => !e.altKey && e.key === "h", () => setFolding(!folding)],
   [e => e.key === "Escape" && isAligned(), () => relink()],
   [e => !e.altKey && e.key === "t", () => cycleTheme()],
+  [e => !e.altKey && e.key === "r" && D.review, () => showNotes(!document.body.classList.contains("notes-on"))],
 ];
 
 document.addEventListener("keydown", e => {
@@ -1656,9 +1931,155 @@ function openInEditor(i) {
   a.click();
 }
 
+// ---------------------------------------------------------------- review notes
+// With --notes, a panel under the panes shows the notes of the selected change. A note
+// marks line ranges on both sides. A change shows each note whose lines it overlaps.
+// A click on a change or a jump selects it. After a scroll moves the selection off the
+// screen, the change nearest to the anchor line becomes the selection.
+let sel = -1;  // The selected change: an index into LY.dops, or -1.
+let overviewOn = false, notesKey = null;
+const NOTESBODY = document.getElementById("notesbody"), OVBTN = document.getElementById("ovbtn");
+const notesOf = {};
+if (D.review) for (const n of D.review.notes) if (n.file >= 0) (notesOf[n.file] ||= []).push(n);
+
+const isChange = o => o[0] !== "e" && o[0] !== "f";
+
+// The change that contains display row "row" of one side, or -1.
+function blockAt(row, side) {
+  return LY.dops.findIndex(o => isChange(o) && (side === "a" ? row >= o[1] && row < o[2] : row >= o[3] && row < o[4]));
+}
+
+function linesOf(k) {
+  const [, a1, a2, b1, b2] = LY.dops[k];
+  const pick = (rows, r1, r2) => rows.slice(r1, r2).filter(e => typeof e === "number");
+  return {a: pick(LY.rowsA, a1, a2), b: pick(LY.rowsB, b1, b2)};
+}
+
+function notesFor(k) {
+  if (k < 0 || !LY.dops[k]) return [];
+  const {a, b} = linesOf(k);
+  const hits = (ranges, lines) => lines.some(i => ranges.some(([s, e]) => i >= s && i < e));
+  return (notesOf[cur] || []).filter(n => hits(n.a, a) || hits(n.b, b));
+}
+
+function select(k) {
+  if (!D.review || !LY) return;
+  sel = k;
+  for (const el of document.querySelectorAll(".r.selr")) el.classList.remove("selr");
+  if (k >= 0) {
+    const {a, b} = linesOf(k);
+    for (const i of a) L.querySelector(`.r[data-i="${i}"]`)?.classList.add("selr");
+    for (const i of b) R.querySelector(`.r[data-i="${i}"]`)?.classList.add("selr");
+  }
+  requestDraw();
+  updateNotes();
+}
+
+// Keep the selection while it shows on the screen. Otherwise select the change nearest
+// to the anchor line. Not during an animation: a jump selects its target before it arrives.
+function autoSelect() {
+  if (!D.review || animating || !LY) return;
+  const la = L.scrollTop / LH, lb = la + L.clientHeight / LH;
+  const ra = R.scrollTop / LH, rb = ra + R.clientHeight / LH;
+  const over = (s, e, lo, hi) => s < hi && Math.max(e, s + 0.01) > lo;
+  const vis = o => over(o[1], o[2], la, lb) || over(o[3], o[4], ra, rb);
+  if (sel >= 0 && LY.dops[sel] && vis(LY.dops[sel])) return;
+  let best = -1, dist = Infinity;
+  LY.dops.forEach((o, k) => {
+    if (!isChange(o) || !vis(o)) return;
+    const d = Math.min(Math.abs(vOfRow(o[1], "a") - vNow), Math.abs(vOfRow(o[3], "b") - vNow));
+    if (d < dist) { dist = d; best = k; }
+  });
+  if (best !== sel) select(best);
+}
+
+const riskHtml = n => (n.risk ? `<span class="risk ${n.risk}">${n.risk}</span>` : "") +
+  (n.exact ? "" : '<span class="fuzzy" title="The code changed after the report. The note matches similar lines.">approximate</span>');
+
+function updateNotes() {
+  if (!D.review) return;
+  const list = overviewOn ? [] : notesFor(sel);
+  const key = overviewOn ? "overview" : `${cur}:${sel < 0}:${list.map(n => D.review.notes.indexOf(n)).join(",")}`;
+  if (key === notesKey) return;
+  notesKey = key;
+  const title = document.getElementById("notestitle");
+  let h;
+  if (overviewOn) {
+    title.textContent = D.review.name;
+    const lost = D.review.notes.filter(n => n.file < 0);
+    h = `<div class="md">${D.review.overview}</div>` + (lost.length
+      ? `<h3>Notes that match no change</h3>` + lost.map(n => `<div class="note md">${riskHtml(n)}${n.html}</div>`).join("")
+      : "");
+  } else if (list.length) {
+    title.innerHTML = list.map(n => esc(n.title) + riskHtml(n)).join(" &nbsp;·&nbsp; ");
+    h = list.map(n => `<div class="note md">${n.html}</div>`).join("");
+  } else {
+    title.textContent = pathOf(D.files[cur]);
+    const intro = D.review.intros[cur];
+    const msg = !notesOf[cur] ? "The report has no notes for this file."
+      : sel >= 0 ? "The report has no note for this change." : "Select a change to see its note.";
+    h = `<p class="none">${msg}</p>` + (intro ? `<div class="md">${intro}</div>` : "");
+  }
+  NOTESBODY.innerHTML = h;
+  NOTESBODY.scrollTop = 0;
+}
+
+function showNotes(on, save = true) {
+  document.body.classList.toggle("notes-on", on);
+  document.getElementById("notesbtn").setAttribute("aria-pressed", String(on));
+  if (save) try { localStorage.setItem("blockdiff.notes", on ? "1" : "0"); } catch (e) { /* storage unavailable */ }
+}
+
+OVBTN.addEventListener("click", () => {
+  overviewOn = !overviewOn;
+  OVBTN.setAttribute("aria-pressed", String(overviewOn));
+  updateNotes();
+});
+document.getElementById("notesbtn").addEventListener("click", () => showNotes(!document.body.classList.contains("notes-on")));
+
+// Drag the top edge of the panel to change its height.
+const NOTES_MIN = 60;
+function setNotesHeight(px, save = true) {
+  px = Math.round(Math.min(Math.max(px, NOTES_MIN), window.innerHeight * 0.8));
+  document.documentElement.style.setProperty("--notesh", px + "px");
+  if (save) try { localStorage.setItem("blockdiff.notesh", String(px)); } catch (e) { /* storage unavailable */ }
+}
+{
+  const grip = document.querySelector("#notes .grip");
+  let y0 = null, h0 = 0;
+  grip.addEventListener("pointerdown", e => {
+    y0 = e.clientY;
+    h0 = document.getElementById("notes").getBoundingClientRect().height;
+    try { grip.setPointerCapture(e.pointerId); } catch (err) { /* synthetic event */ }
+  });
+  grip.addEventListener("pointermove", e => { if (y0 !== null) setNotesHeight(h0 + y0 - e.clientY, false); });
+  const end = () => {
+    if (y0 === null) return;
+    y0 = null;
+    setNotesHeight(document.getElementById("notes").getBoundingClientRect().height);
+  };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+}
+
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
+  if (D.review) {
+    let on = true, h = NaN;
+    try {
+      on = localStorage.getItem("blockdiff.notes") !== "0";
+      h = parseFloat(localStorage.getItem("blockdiff.notesh"));
+    } catch (e) { /* storage unavailable */ }
+    if (h > 0) setNotesHeight(h, false);
+    showNotes(on, false);
+    document.getElementById("notesbtn").hidden = false;
+    document.getElementById("rhelp").hidden = false;
+    const n = D.review.notes.length, lost = D.review.notes.filter(x => x.file < 0).length;
+    const count = document.getElementById("notescount");
+    count.textContent = `${n} notes` + (lost ? ` · ${lost} match no change` : "");
+    if (lost) count.title = "See Report overview";
+  }
   if (D.pr) {
     document.body.classList.add("pr");
     const a = document.getElementById("prlink");
@@ -1754,6 +2175,7 @@ def main() -> int:
     ap.add_argument("--paths", nargs="*", default=[], help="limit the diff to these paths")
     ap.add_argument("--pr", help="GitHub pull request (number or URL) for the line links (default: the PR of the branch)")
     ap.add_argument("--no-pr", action="store_true", help="do not look up a GitHub pull request")
+    ap.add_argument("--notes", metavar="REPORT.md", help="review report with a note per hunk, shown under the panes")
     args = ap.parse_args()
     pr_proc = None if args.no_pr else start_pr_lookup("." if args.dirs else args.repo, args.pr)
 
@@ -1790,6 +2212,7 @@ def main() -> int:
         return 0
     payload = build_payload(Analysis(files), title)
     payload["pr"] = finish_pr_lookup(pr_proc)
+    payload["review"] = load_notes(args.notes, files) if args.notes else None
     out = args.output
     if not out:
         # Use a fixed file per user. Firefox gives each local file its own localStorage,
@@ -1805,6 +2228,12 @@ def main() -> int:
     )
     if payload["pr"]:
         print(f"blockdiff: line numbers link to {payload['pr']['url']}")
+    if payload["review"]:
+        rv = payload["review"]
+        fuzzy = sum(1 for n in rv["notes"] if n["file"] >= 0 and not n["exact"])
+        print(f"blockdiff: {len(rv['notes'])} notes, {fuzzy} matched by similar lines, {len(rv['unmatched'])} not matched")
+        for t in rv["unmatched"]:
+            print(f"blockdiff:   not matched: {t}")
     if not args.no_open:
         print(f"blockdiff: opened in {open_browser(out)}")
     return 0

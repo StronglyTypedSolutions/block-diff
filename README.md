@@ -31,6 +31,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
 - Syntax colors for Python files. The colors change only the text, so the diff backgrounds stay clear. Dark mode uses pale pastel colors.
 - Light and dark themes. A button (or `t`) switches between the system theme, dark, and light. The page remembers your choice.
+- Review notes: with `--notes`, a panel under the panes shows the note of the selected change from a Markdown review report. See [Review notes](#review-notes).
 
 ![Identical lines hidden, dark theme](docs/folded-dark.png)
 
@@ -38,7 +39,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 
 ## Requirements
 
-- Python 3.10 or later. The tool uses only the Python standard library.
+- [uv](https://docs.astral.sh/uv/). The script starts with `uv run --script`, and uv installs its one dependency, `markdown-it-py`, on the first run. Without uv, run `python3 blockdiff`. Python 3.10 or later is then enough for everything except `--notes`, which also needs `markdown-it-py`.
 - Git, for the revision modes.
 - A web browser.
 
@@ -73,6 +74,7 @@ Options:
 | `--paths PATH ...` | Compare only these paths. |
 | `--pr PR` | Link the line numbers to this GitHub pull request (number or URL). The default is the pull request of the current branch. |
 | `--no-pr` | Do not look up a GitHub pull request. |
+| `--notes REPORT.md` | Show the notes of a review report in a panel under the panes. |
 
 You can also add a link to a specific file and line: `page.html#f=ovrtx_usd.py&l=200&fold=1`. The parameter `f` is a file index or the end of a path. The parameter `l` is a line number on the left side. The parameter `fold` sets the "hide identical lines" mode.
 
@@ -106,13 +108,35 @@ If the GitHub CLI (`gh`) finds a pull request for the current branch, the line n
 
 Log in to GitHub first. Without a login, GitHub opens the page but does not scroll to the line. All clicks reuse one browser tab. GitHub can only show lines in the diff of the pull request, and only lines in or near a change accept comments. If your diff differs from the pull request diff, for example because of uncommitted changes, the line numbers can differ too.
 
+## Review notes
+
+A review report explains each hunk of a change, for example with "what", "why", and "risks". An agent that wrote the code can write such a report. With `--notes`, a panel under the panes shows the note of the selected change:
+
+```bash
+blockdiff main...HEAD --notes review.md
+```
+
+- A click on a change, a click on its band in the middle bar, or a jump with `n`, `p`, or `F7` selects the change. The selected change has highlighted line numbers.
+- When you scroll the selected change off the screen, the change nearest to the middle of the screen becomes the selection.
+- If one change overlaps several notes, the panel shows all of them.
+- The "Report overview" button shows the start of the report, and the notes that match no change.
+- Drag the top edge of the panel to change its height. Press `r` to hide or show the panel.
+
+The report is Markdown with this convention:
+
+- A heading with the file path in backticks starts the notes of that file, for example ``### 3.1 `source/pkg/module.py` ``. The path can be the full path or its end.
+- Each note is a section under that heading, for example `#### Hunk 3.1.2`. The note contains the hunk in a fenced code block with the language `diff`, including its `@@` header.
+- Optional: `**Risk: High**`, `**Risk: Medium**`, or `**Risk: Low**` in the note. The panel shows the risk class next to the title.
+
+The tool finds each hunk by its content, not by the line numbers in the `@@` header. A note thus still finds its lines after a rebase or after more commits. If the code changed after the report, the tool uses the lines that it still finds. The panel then marks the note as "approximate". The tool prints the number of notes that match no change. Raw HTML in the report shows as text.
+
 ## Open files in VS Code
 
 A double-click on a file in the list opens a `vscode://file/...` link. VS Code installs the handler for these links. The first time, the browser asks if it can open the link. In revision mode, the link opens the file in the working tree. In folder mode, it opens the file in the right folder. Git difftool deletes its temporary copies after the call, so these files have no link. Working tree files in the difftool folder are links to the working tree, so these files keep their link.
 
 ## Settings
 
-The page keeps the "hide identical lines", theme, and pane split settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
+The page keeps the "hide identical lines", theme, pane split, and notes panel settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
 
 The code uses JetBrains Mono at 14 px with a 20 px line height if the font is installed. Otherwise it uses the default monospace font.
 
@@ -127,6 +151,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `h` | Hide or show identical lines. |
 | `Esc` | Link the panes again after you aligned a block. |
 | `t` | Switch the theme: system, dark, light. |
+| `r` | Hide or show the review notes panel (with `--notes`). |
 
 Drag the middle bar to resize the panes. Double-click it to make both panes equally wide again. Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
