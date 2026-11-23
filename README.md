@@ -27,7 +27,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Word-level highlights in changed lines and in edited moved blocks. Removed words are red on the left. Added words are green on the right. The word diff runs over the whole changed block, so a reflowed comment marks only the words that really changed.
 - A flat list of all changed files. The selected file has a blue background and a bold name. Double-click a file to open it in VS Code at the line that shows in the right pane.
 - Resizable panes: drag the middle bar to the left or right. Double-click it to restore the 50/50 split. The page remembers the split.
-- A minimap with the old file in the left half and the new file in the right half. You can click and drag it.
+- A minimap with the old file in the left half and the new file in the right half. Both halves and the thumb use the shared scroll position, so the thumb shows what both panes show. You can click and drag it.
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
 - Syntax colors for Python files. The colors change only the text, so the diff backgrounds stay clear. Dark mode uses pale pastel colors.
 - Light and dark themes. A button (or `t`) switches between the system theme, dark, and light. The page remembers your choice.

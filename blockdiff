@@ -1058,17 +1058,21 @@ function showFile(i, scrollToFirst = true) {
 
 // ---------------------------------------------------------------- minimap
 // The left half shows the old file, the right half the new file.
+// Both halves use the shared virtual axis, like the thumb. Thus a row in the minimap
+// is at the same height as the thumb when the row shows in its pane.
 function buildOverview(f) {
-  const na = Math.max(LY.rowsA.length, 1), nb = Math.max(LY.rowsB.length, 1);
-  const mk = (cls, side, r1, r2, n, extra = "") =>
-    `<div class="mk ${side} ${cls}" style="top:${(r1 / n) * 100}%;height:${((r2 - r1) / n) * 100}%${extra}"></div>`;
+  const n = Math.max(VTOTAL, 1), side = s => (s === "la" ? "a" : "b");
+  const mk = (cls, s, r1, r2, extra = "") => {
+    const v1 = vOfRow(r1, side(s)), v2 = vOfRowEnd(r2, side(s));
+    return `<div class="mk ${s} ${cls}" style="top:${(v1 / n) * 100}%;height:${(Math.max(v2 - v1, 0) / n) * 100}%${extra}"></div>`;
+  };
   let h = "";
   for (const [t, a1, a2, b1, b2] of LY.dops) {
-    if (t === "d" || t === "c") h += mk(t, "la", a1, a2, na);
-    if (t === "a" || t === "c") h += mk(t, "rb", b1, b2, nb);
+    if ((t === "d" || t === "c") && a2 > a1) h += mk(t, "la", a1, a2);
+    if ((t === "a" || t === "c") && b2 > b1) h += mk(t, "rb", b1, b2);
   }
-  for (const [s, n, mid] of f.ma) h += mk("mv", "la", LY.ya[s], LY.ya[s + n], na, `;--h:${hue(mid)}`);
-  for (const [s, n, mid] of f.mb) h += mk("mv", "rb", LY.yb[s], LY.yb[s + n], nb, `;--h:${hue(mid)}`);
+  for (const [s, n, mid] of f.ma) h += mk("mv", "la", LY.ya[s], LY.ya[s + n], `;--h:${hue(mid)}`);
+  for (const [s, n, mid] of f.mb) h += mk("mv", "rb", LY.yb[s], LY.yb[s + n], `;--h:${hue(mid)}`);
   OV.innerHTML = h + '<div class="view" id="ovview"></div>' +
     '<button class="relink" id="relink" title="Link the panes again (Esc)">' +
     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
@@ -1082,9 +1086,26 @@ function updateThumb() {
   const aligned = isAligned();
   OV.classList.toggle("aligned", aligned);
   if (aligned) OV.style.setProperty("--pos", (VTOTAL > 0 ? (vNow / VTOTAL) * 100 : 0) + "%");
-  const total = Math.max(LY.rowsA.length, 1) * LH;
-  v.style.top = Math.min(L.scrollTop / total, 1) * 100 + "%";
-  v.style.height = Math.min(L.clientHeight / total, 1) * 100 + "%";
+  const [top, height] = thumbFrac();
+  v.style.top = top * 100 + "%";
+  v.style.height = height * 100 + "%";
+}
+
+// The thumb as fractions of the minimap height, on the shared virtual axis.
+// At position v, the anchor row is at anchorFrac(v) of the pane height. So the
+// pane shows the virtual range [v - f * S, v + (1 - f) * S] for S rows on screen.
+function thumbFrac() {
+  const S = L.clientHeight / LH;
+  if (VTOTAL <= S) return [0, 1];
+  const v = clampV(vNow);
+  return [(v - anchorFrac(v) * S) / VTOTAL, S / VTOTAL];
+}
+
+// The inverse of thumbFrac(): the virtual position for a thumb top.
+function vForThumbTop(t) {
+  const S = L.clientHeight / LH;
+  if (VTOTAL <= S) return 0;
+  return clampV((t * VTOTAL * VTOTAL) / (VTOTAL - S));
 }
 
 // Click on the minimap to jump there. Drag the thumb (or anywhere) to scroll.
@@ -1094,9 +1115,9 @@ OV.addEventListener("pointerdown", e => {
   if (e.target.closest(".relink")) { relink(); e.preventDefault(); return; }
   relink();  // Fade an alignment out instead of removing it at once.
   // Compute the thumb from the scroll position. The DOM thumb can lag one frame.
-  const r = OV.getBoundingClientRect(), total = Math.max(LY.rowsA.length, 1) * LH;
-  const vTop = r.top + Math.min(L.scrollTop / total, 1) * r.height;
-  const vH = Math.min(L.clientHeight / total, 1) * r.height;
+  const r = OV.getBoundingClientRect(), [tf, hf] = thumbFrac();
+  const vTop = r.top + tf * r.height;
+  const vH = hf * r.height;
   const onThumb = e.clientY >= vTop && e.clientY <= vTop + Math.max(vH, 6);
   drag = {grab: onThumb ? e.clientY - vTop : vH / 2, top: r.top, height: r.height};
   try { OV.setPointerCapture(e.pointerId); } catch (err) { /* synthetic event */ }
@@ -1113,7 +1134,7 @@ OV.addEventListener("pointercancel", endDrag);
 // "follow" eases after the pointer (dragging). Otherwise the move is a smooth jump.
 function dragTo(y, follow) {
   const frac = (y - drag.grab - drag.top) / drag.height;
-  scrollToV(vForTop(L, frac * LY.rowsA.length * LH, false), true, follow);
+  scrollToV(vForThumbTop(frac), true, follow);
 }
 
 // ---------------------------------------------------------------- scroll model
@@ -1202,6 +1223,16 @@ function vOfRow(row, side) {
   for (const s of VS) {
     const r1 = side === "a" ? s[2] : s[4], r2 = side === "a" ? s[3] : s[5];
     if (r2 > r1 && row >= r1 && row < r2) return s[0] + ((row - r1) / (r2 - r1)) * s[1];
+  }
+  return row <= 0 ? 0 : VTOTAL;
+}
+
+// The virtual position of the end of display row row - 1 on one side. Unlike
+// vOfRow(row), this does not skip the following rows of the other side only.
+function vOfRowEnd(row, side) {
+  for (const s of VS) {
+    const r1 = side === "a" ? s[2] : s[4], r2 = side === "a" ? s[3] : s[5];
+    if (r2 > r1 && row > r1 && row <= r2) return s[0] + ((row - r1) / (r2 - r1)) * s[1];
   }
   return row <= 0 ? 0 : VTOTAL;
 }
