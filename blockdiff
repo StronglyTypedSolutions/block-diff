@@ -689,7 +689,7 @@ try {
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
   font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
 #app { display: grid; height: 100vh;
-  grid-template-columns: 300px minmax(0, 1fr) 128px minmax(0, 1fr) 42px;
+  grid-template-columns: 300px minmax(0, var(--lfr, 1fr)) 128px minmax(0, var(--rfr, 1fr)) 42px;
   grid-template-rows: auto auto minmax(0, 1fr); }
 header { grid-column: 1 / -1; display: flex; gap: 16px; align-items: baseline;
   padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -739,7 +739,8 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 .tag { position: sticky; right: 6px; display: inline-block; line-height: 17px; margin-left: 2em; padding: 0 7px; border-radius: 9px; font: 11px system-ui, sans-serif;
   color: #fff; background: hsl(var(--h) 60% var(--tag-l)); }
 #gutter { display: block; width: 100%; height: 100%; border-left: 1px solid var(--line);
-  border-right: 1px solid var(--line); }
+  border-right: 1px solid var(--line); cursor: col-resize; touch-action: none; }
+#gutter.resizing, #gutter.resizing g { cursor: col-resize; }
 #gutter g { cursor: pointer; }
 #gutter .fill { stroke: none; }
 #gutter .edge { fill: none; stroke-width: 1; pointer-events: none; }
@@ -1278,6 +1279,56 @@ for (const pane of [L, R]) {
   });
 }
 window.addEventListener("resize", () => applyV(vNow));
+
+// Drag the gutter to the left or right to resize the panes. Double-click resets the split.
+// A drag starts only after a few pixels, so a click on a band still aligns it.
+const SPLIT_MIN = 0.15, SPLIT_MAX = 0.85;
+function setSplit(f, save = true) {
+  f = Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, f));
+  document.documentElement.style.setProperty("--lfr", `${f}fr`);
+  document.documentElement.style.setProperty("--rfr", `${1 - f}fr`);
+  if (save) try { localStorage.setItem("blockdiff.split", String(f)); } catch (e) { /* storage unavailable */ }
+  if (LY) applyV(vNow);
+}
+try {
+  const saved = parseFloat(localStorage.getItem("blockdiff.split"));
+  if (saved > 0 && saved < 1) setSplit(saved, false);
+} catch (e) { /* storage unavailable */ }
+let split = null;  // {x0, dragging} while the pointer is down on the gutter
+let suppressClick = false;
+G.addEventListener("pointerdown", e => {
+  if (e.button === 0) split = {x0: e.clientX, id: e.pointerId, dragging: false};
+});
+G.addEventListener("pointermove", e => {
+  if (!split) return;
+  if (!split.dragging) {
+    if (Math.abs(e.clientX - split.x0) < 4) return;
+    split.dragging = true;
+    G.classList.add("resizing");
+    try { G.setPointerCapture(split.id); } catch (err) { /* synthetic event */ }
+  }
+  const l = L.getBoundingClientRect(), r = R.getBoundingClientRect();
+  const panes = l.width + r.width;
+  if (panes > 0) setSplit((e.clientX - l.left - G.clientWidth / 2) / panes, false);
+});
+function endSplit() {
+  if (!split) return;
+  if (split.dragging) {
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 0);
+    G.classList.remove("resizing");
+    const l = L.getBoundingClientRect().width, r = R.getBoundingClientRect().width;
+    if (l + r > 0) setSplit(l / (l + r));
+  }
+  split = null;
+}
+G.addEventListener("pointerup", endSplit);
+G.addEventListener("pointercancel", endSplit);
+G.addEventListener("dblclick", () => setSplit(0.5));
+// The click after a drag must not align a band.
+G.addEventListener("click", e => {
+  if (suppressClick) { suppressClick = false; e.stopImmediatePropagation(); }
+}, true);
 
 // Click a band in the gutter to align its left and right parts.
 G.addEventListener("click", e => {

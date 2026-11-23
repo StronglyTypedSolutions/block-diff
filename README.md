@@ -26,6 +26,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Clear labels: "moved", "moved, only indentation changed", or "moved with 2 changed lines". A marker at the left edge shows the changed lines in a moved block.
 - Word-level highlights in changed lines and in edited moved blocks.
 - A flat list of all changed files.
+- Resizable panes: drag the middle bar to the left or right. Double-click it to restore the 50/50 split. The page remembers the split.
 - A minimap with the old file in the left half and the new file in the right half. You can click and drag it.
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
 - Syntax colors for Python files. The colors change only the text, so the diff backgrounds stay clear. Dark mode uses pale pastel colors.
@@ -95,7 +96,7 @@ git config --global alias.bdd 'difftool -d -t blockdiff'    # git bdd HEAD~1
 
 ## Settings
 
-The page keeps the "hide identical lines" and theme settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
+The page keeps the "hide identical lines", theme, and pane split settings in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
 
 The code uses JetBrains Mono at 14 px with a 20 px line height if the font is installed. Otherwise it uses the default monospace font.
 
@@ -111,7 +112,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `Esc` | Link the panes again after you aligned a block. |
 | `t` | Switch the theme: system, dark, light. |
 
-Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
+Drag the middle bar to resize the panes. Double-click it to make both panes equally wide again. Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
 ## How it works
 
