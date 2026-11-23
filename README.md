@@ -71,6 +71,8 @@ Options:
 | `-o FILE` | Write the HTML page to `FILE`. The default is `/tmp/blockdiff-<uid>/blockdiff.html`. |
 | `--no-open` | Do not open the browser. |
 | `--paths PATH ...` | Compare only these paths. |
+| `--pr PR` | Link the line numbers to this GitHub pull request (number or URL). The default is the pull request of the current branch. |
+| `--no-pr` | Do not look up a GitHub pull request. |
 
 You can also add a link to a specific file and line: `page.html#f=ovrtx_usd.py&l=200&fold=1`. The parameter `f` is a file index or the end of a path. The parameter `l` is a line number on the left side. The parameter `fold` sets the "hide identical lines" mode.
 
@@ -93,6 +95,16 @@ Two aliases make the daily use short:
 git config --global alias.bd '!blockdiff'                   # git bd main...HEAD
 git config --global alias.bdd 'difftool -d -t blockdiff'    # git bdd HEAD~1
 ```
+
+## Comment on GitHub pull requests
+
+If the GitHub CLI (`gh`) finds a pull request for the current branch, the line numbers become links. The header then shows the pull request number. The lookup runs in the background while the analysis runs.
+
+- Click a line number to open that line in the "Files changed" page of the pull request. Left line numbers open the old side, right line numbers the new side.
+- Shift+click a second line number on the same side to open the range between the two lines.
+- To write the comment, click the "+" next to the line on GitHub. GitHub has no link that opens the comment box directly.
+
+All clicks reuse one browser tab. GitHub can only show lines in the diff of the pull request, and only lines in or near a change accept comments. If your diff differs from the pull request diff, for example because of uncommitted changes, the line numbers can differ too.
 
 ## Open files in VS Code
 

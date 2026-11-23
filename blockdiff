@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import difflib
+import hashlib
 import io
 import keyword
 import json
@@ -607,6 +608,34 @@ def whitespace_change(xa: list[str], yb: list[str]) -> int:
     return result
 
 
+def start_pr_lookup(cwd: str, pr: str | None) -> subprocess.Popen | None:
+    """Ask the GitHub CLI for the pull request of the current branch, or for PR "pr".
+
+    The lookup runs in the background while the analysis runs.
+    """
+    if not shutil.which("gh"):
+        return None
+    cmd = ["gh", "pr", "view", *([pr] if pr else []), "--json", "number,url"]
+    try:
+        return subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def finish_pr_lookup(proc: subprocess.Popen | None) -> dict | None:
+    if proc is None:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=10)
+        info = json.loads(out) if proc.returncode == 0 else None
+    except (subprocess.TimeoutExpired, ValueError):
+        proc.kill()
+        return None
+    if not info or not str(info.get("url", "")).startswith("https://"):
+        return None
+    return {"number": info["number"], "url": info["url"]}
+
+
 def build_payload(an: Analysis, title: str) -> dict:
     files = an.files
     move_a = [[-1] * len(f.a) for f in files]
@@ -651,6 +680,8 @@ def build_payload(an: Analysis, title: str) -> dict:
                 "new": f.new_path,
                 "binary": f.binary,
                 "disk": f.disk,
+                # GitHub names the diff of a file "diff-" + SHA-256 of its path.
+                "gh": hashlib.sha256((f.new_path or f.old_path or "").encode()).hexdigest(),
                 "a": f.a,
                 "b": f.b,
                 "ca": "".join(ca),
@@ -794,6 +825,11 @@ header #summary { white-space: nowrap; }
 /* Right pane: line numbers at the right edge, so the code starts next to the gutter. */
 #right .r { display: flex; }
 #right .r .t { flex: 1 0 auto; }
+/* With a pull request, a click on a line number opens that line on GitHub. */
+.pr .r[data-i] .n { cursor: pointer; }
+.pr .r[data-i] .n:hover { color: var(--chg-s); text-decoration: underline; }
+.n.picked { color: var(--chg-s); font-weight: 700; }
+#prlink { color: var(--chg-s); white-space: nowrap; }
 #right .r .n { order: 2; left: auto; right: 0; padding-right: .7em; padding-left: .7em; }
 #right .tag { right: calc(4.2 * 14px + 6px); }  /* The number column: 4.2em at 14px. */
 .r.d { background: var(--del); } .r.a { background: var(--add); } .r.c { background: var(--chg); }
@@ -861,7 +897,7 @@ header button[aria-pressed="true"] { background: var(--chg); border-color: var(-
 </head>
 <body>
 <div id="app">
-  <header><b>blockdiff</b><span id="summary"></span>
+  <header><b>blockdiff</b><span id="summary"></span><a id="prlink" target="blockdiff-pr" hidden></a>
     <button id="themebtn" title="Theme: system, dark, or light (t)">System theme (t)</button>
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
     <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme</span></header>
@@ -1398,6 +1434,8 @@ for (const pane of [L, R]) {
     applyV(v, pane);
   }, {passive: true});
   pane.addEventListener("click", e => {
+    const num = e.target.closest(".r[data-i] > .n");
+    if (num && D.pr) return openPrLine(pane === L ? "a" : "b", +num.parentElement.dataset.i, e.shiftKey, num);
     const fold = e.target.closest(".r.fold");
     if (fold) return openFold(fold, pane);
     const row = e.target.closest(".r[data-m]");
@@ -1586,6 +1624,24 @@ document.addEventListener("keydown", e => {
   if (hit) { e.preventDefault(); hit[1](); }
 });
 
+// Open a line, or with Shift a range from the last picked line, in the pull request on GitHub.
+// GitHub names a line "diff-<SHA-256 of the path>" + "L" (old side) or "R" (new side) + number.
+// The page opens in one reused tab. To comment, click the "+" next to the line there.
+let prPick = null;  // {file, side, line, el}: the last picked line
+function openPrLine(side, i, extend, el) {
+  const f = D.files[cur], s = side === "a" ? "L" : "R";
+  let a = i + 1, b = i + 1;
+  if (extend && prPick && prPick.file === cur && prPick.side === side) {
+    a = Math.min(prPick.line, i + 1);
+    b = Math.max(prPick.line, i + 1);
+  }
+  prPick?.el?.classList.remove("picked");
+  prPick = {file: cur, side, line: i + 1, el};
+  el.classList.add("picked");
+  const range = a === b ? `${s}${a}` : `${s}${a}-${s}${b}`;
+  window.open(`${D.pr.url}/files#diff-${f.gh}${range}`, "blockdiff-pr");
+}
+
 // Open a file in VS Code at the first line that shows in the right pane.
 // The vscode:// link needs VS Code as the handler of that URL scheme.
 function openInEditor(i) {
@@ -1603,6 +1659,14 @@ function openInEditor(i) {
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
+  if (D.pr) {
+    document.body.classList.add("pr");
+    const a = document.getElementById("prlink");
+    a.href = D.pr.url + "/files";
+    a.textContent = `PR #${D.pr.number}`;
+    a.title = "Click a line number to open that line in this pull request. Shift+click selects a range.";
+    a.hidden = false;
+  }
   let adds = 0, dels = 0;
   D.files.forEach((f, i) => {
     const counts = {a: 0, d: 0, m: 0};
@@ -1688,7 +1752,10 @@ def main() -> int:
     ap.add_argument("-o", "--output", help="HTML output file (default: /tmp/blockdiff-<uid>/blockdiff.html)")
     ap.add_argument("--no-open", action="store_true", help="do not open the browser")
     ap.add_argument("--paths", nargs="*", default=[], help="limit the diff to these paths")
+    ap.add_argument("--pr", help="GitHub pull request (number or URL) for the line links (default: the PR of the branch)")
+    ap.add_argument("--no-pr", action="store_true", help="do not look up a GitHub pull request")
     args = ap.parse_args()
+    pr_proc = None if args.no_pr else start_pr_lookup("." if args.dirs else args.repo, args.pr)
 
     if args.dirs:
         files = from_dirs(*args.dirs)
@@ -1722,6 +1789,7 @@ def main() -> int:
         print("blockdiff: no differences", file=sys.stderr)
         return 0
     payload = build_payload(Analysis(files), title)
+    payload["pr"] = finish_pr_lookup(pr_proc)
     out = args.output
     if not out:
         # Use a fixed file per user. Firefox gives each local file its own localStorage,
@@ -1735,6 +1803,8 @@ def main() -> int:
         f"blockdiff: {len(files)} files, {kinds.count('moved')} moved, "
         f"{kinds.count('similar')} similar, {kinds.count('reindent')} re-indented blocks -> {out}"
     )
+    if payload["pr"]:
+        print(f"blockdiff: line numbers link to {payload['pr']['url']}")
     if not args.no_open:
         print(f"blockdiff: opened in {open_browser(out)}")
     return 0
