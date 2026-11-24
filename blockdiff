@@ -1921,7 +1921,7 @@ const KEYS = [
   [e => !e.altKey && e.key === "h", () => setFolding(!folding)],
   [e => e.key === "Escape" && isAligned(), () => relink()],
   [e => !e.altKey && e.key === "t", () => cycleTheme()],
-  [e => !e.altKey && e.key === "v" && cur >= 0, () => setReviewed(cur, reviewed[reviewId(D.files[cur])] !== D.files[cur].rh)],
+  [e => !e.altKey && e.key === "v" && cur >= 0, () => reviewAndNext()],
   [e => !e.altKey && e.key === "r" && D.review, () => showNotes(!document.body.classList.contains("notes-on"))],
 ];
 
@@ -2144,6 +2144,18 @@ function setReviewed(i, on) {
   if (on) reviewed[reviewId(f)] = f.rh; else delete reviewed[reviewId(f)];
   try { localStorage.setItem(REVIEW_KEY, JSON.stringify(reviewed)); } catch (e) { /* storage unavailable */ }
   showReviewed();
+}
+
+// The v key ticks the current file and goes to the next file that still needs a review:
+// one without a tick, or one that changed since its review. Untick stays on the file.
+function reviewAndNext() {
+  const isDone = i => reviewed[reviewId(D.files[i])] === D.files[i].rh;
+  if (isDone(cur)) { setReviewed(cur, false); return; }
+  setReviewed(cur, true);
+  for (let k = 1; k < D.files.length; k++) {
+    const i = (cur + k) % D.files.length;
+    if (!isDone(i)) { showFile(i); return; }
+  }
 }
 
 function showReviewed() {

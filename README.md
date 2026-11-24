@@ -138,7 +138,7 @@ The tool finds each hunk by its content, not by the line numbers in the `@@` hea
 
 ## Review marks
 
-Each file in the list has a box. Tick it when you reviewed the file, or press `v` for the current file. The box has three states:
+Each file in the list has a box. Tick it when you reviewed the file, or press `v` for the current file. The `v` key then opens the next file that still needs a review: one without a tick, or one that changed since its review. The search wraps around to the top of the list. The box has three states:
 
 - Empty: not reviewed.
 - Ticked: reviewed. The name is dimmed.
@@ -168,7 +168,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `Esc` | Link the panes again after you aligned a block. |
 | `t` | Switch the theme: system, dark, light. |
 | `r` | Hide or show the review notes panel (with `--notes`). |
-| `v` | Mark the current file as reviewed, or clear the mark. |
+| `v` | Mark the current file as reviewed and go to the next file that still needs a review. On a reviewed file, clear the mark. |
 
 Drag the middle bar to resize the panes. Double-click it to make both panes equally wide again. Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
