@@ -137,7 +137,7 @@ The tool finds each hunk by its content, not by the line numbers in the `@@` hea
 
 ## Open files in VS Code
 
-A double-click on a file in the list opens a `vscode://file/...` link. VS Code installs the handler for these links. The first time, the browser asks if it can open the link. In revision mode, the link opens the file in the working tree. In folder mode, it opens the file in the right folder. Git difftool deletes its temporary copies after the call, so these files have no link. Working tree files in the difftool folder are links to the working tree, so these files keep their link.
+The "Open file" button in the title bar of the right pane, or a double-click on a file in the list, opens a `vscode://file/...` link. VS Code installs the handler for these links. The first time, the browser asks if it can open the link. In revision mode, the link opens the file in the working tree. In folder mode, it opens the file in the right folder. Git difftool deletes its temporary copies after the call, so these files have no link. Working tree files in the difftool folder are links to the working tree, so these files keep their link.
 
 ## Settings
 

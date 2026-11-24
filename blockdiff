@@ -1032,6 +1032,12 @@ header #summary { white-space: nowrap; }
 .fi .st.M { color: var(--chg-s); } .fi .st.R { color: #8250df; }
 .fi .cnt { font-size: 11px; color: var(--dim); }
 .fi .cnt .p { color: var(--add-s); } .fi .cnt .m { color: var(--del-s); }
+/* The right title holds the path and the "Open file" button. */
+#rhead { display: flex; align-items: center; gap: 8px; padding-top: 2px; padding-bottom: 2px; }
+#rtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#openbtn { margin-left: auto; flex: none; font: 11px system-ui, sans-serif; padding: 0 8px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#openbtn:hover { border-color: var(--chg-s); }
 .ptitle { padding: 4px 10px; font: 11px "JetBrains Mono", monospace;
   border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gtitle, .otitle { border-bottom: 1px solid var(--line); }
@@ -1163,7 +1169,7 @@ body.notes-on #notes { display: flex; }
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
     <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme<span id="rhelp" hidden> &nbsp; r: notes</span></span></header>
   <div id="files"></div>
-  <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rtitle"></div><div class="otitle"></div>
+  <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rhead"><span id="rtitle"></span><button id="openbtn" title="Open this file in VS Code at the first line in view" hidden>Open file</button></div><div class="otitle"></div>
   <div class="pane" id="left"><div class="content" id="lc"></div></div>
   <svg id="gutter"></svg>
   <div class="pane" id="right"><div class="content" id="rc"></div></div>
@@ -1357,6 +1363,7 @@ function showFile(i, scrollToFirst = true) {
   document.querySelector(".fi.cur")?.scrollIntoView({block: "nearest"});
   document.getElementById("ltitle").textContent = f.old || "(added)";
   document.getElementById("rtitle").textContent = f.new || "(deleted)";
+  document.getElementById("openbtn").hidden = !f.disk;
   render();
   let v = 0;
   if (scrollToFirst) {
@@ -2103,6 +2110,7 @@ function setNotesLeft(x, save = true) {
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
+  document.getElementById("openbtn").addEventListener("click", () => openInEditor(cur));
   if (D.review) {
     let on = true, h = NaN, left = null;
     try {
