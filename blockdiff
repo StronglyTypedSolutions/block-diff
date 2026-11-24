@@ -856,6 +856,18 @@ def load_notes(path: str, files: list[FileDiff]) -> dict:
     }
 
 
+def change_hash(f: FileDiff) -> str:
+    """A fingerprint of the change: the removed and added lines, without line numbers.
+
+    Unrelated edits elsewhere in the file, for example after a rebase, keep the fingerprint.
+    """
+    h = hashlib.sha256(f"{f.status}\0{f.old_path}\0{f.new_path}\0".encode())
+    for tag, i1, i2, j1, j2 in f.opcodes:
+        if tag != "equal":
+            h.update("\0".join(["@", *("-" + x for x in f.a[i1:i2]), *("+" + y for y in f.b[j1:j2])]).encode())
+    return h.hexdigest()[:16]
+
+
 def build_payload(an: Analysis, title: str) -> dict:
     files = an.files
     move_a = [[-1] * len(f.a) for f in files]
@@ -902,6 +914,7 @@ def build_payload(an: Analysis, title: str) -> dict:
                 "disk": f.disk,
                 # GitHub names the diff of a file "diff-" + SHA-256 of its path.
                 "gh": hashlib.sha256((f.new_path or f.old_path or "").encode()).hexdigest(),
+                "rh": change_hash(f),
                 "a": f.a,
                 "b": f.b,
                 "ca": "".join(ca),
@@ -1019,7 +1032,8 @@ header { grid-column: 1 / -1; display: flex; gap: 16px; align-items: baseline;
 header b { font-size: 14px; }
 header .help { margin-left: auto; min-width: 0; color: var(--dim); font-size: 12px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-header #summary { white-space: nowrap; }
+header #summary, header #revcount { white-space: nowrap; }
+header #revcount { color: var(--dim); }
 #files { grid-row: 2 / -1; overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
 .fi { padding: 4px 10px; cursor: pointer; border-left: 3px solid transparent; }
 .fi:hover { background: var(--sel); }
@@ -1028,6 +1042,11 @@ header #summary { white-space: nowrap; }
 .fi.cur .nm { font-weight: 700; }
 .fi .dir { color: var(--dim); font-size: 11px; word-break: break-all; }
 .fi .st { display: inline-block; width: 1.4em; font-weight: 700; }
+/* Review marks: ticked when reviewed, a dash when the change differs from the reviewed one. */
+.fi .rv { margin: 0 6px 0 0; vertical-align: -2px; cursor: pointer; accent-color: var(--add-s); }
+.fi .rv:indeterminate { accent-color: var(--risk-m); }
+.fi.reviewed .nm, .fi.reviewed .st { opacity: .55; }
+.fi .again { color: var(--risk-m); }
 .fi .st.A { color: var(--add-s); } .fi .st.D { color: var(--del-s); }
 .fi .st.M { color: var(--chg-s); } .fi .st.R { color: #8250df; }
 .fi .cnt { font-size: 11px; color: var(--dim); }
@@ -1167,7 +1186,7 @@ body.notes-on #notes { display: flex; }
     <button id="themebtn" title="Theme: system, dark, or light (t)">System theme (t)</button>
     <button id="notesbtn" aria-pressed="true" title="Show or hide the review notes (r)" hidden>Notes (r)</button>
     <button id="foldbtn" aria-pressed="false" title="Hide identical lines, keep 3 context lines (h)">Hide identical lines (h)</button>
-    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme<span id="rhelp" hidden> &nbsp; r: notes</span></span></header>
+    <span class="help">Alt+↓ / Alt+↑ or F7 / Shift+F7: next / previous change &nbsp; Alt+Shift+↓ / Alt+Shift+↑: next / previous file &nbsp; h: hide / show identical lines &nbsp; t: theme<span id="rhelp" hidden> &nbsp; r: notes</span> &nbsp; v: reviewed</span></header>
   <div id="files"></div>
   <div class="ptitle" id="ltitle"></div><div class="gtitle"></div><div class="ptitle" id="rhead"><span id="rtitle"></span><button id="openbtn" title="Open this file in VS Code at the first line in view" hidden>Open file</button></div><div class="otitle"></div>
   <div class="pane" id="left"><div class="content" id="lc"></div></div>
@@ -1902,6 +1921,7 @@ const KEYS = [
   [e => !e.altKey && e.key === "h", () => setFolding(!folding)],
   [e => e.key === "Escape" && isAligned(), () => relink()],
   [e => !e.altKey && e.key === "t", () => cycleTheme()],
+  [e => !e.altKey && e.key === "v" && cur >= 0, () => setReviewed(cur, reviewed[reviewId(D.files[cur])] !== D.files[cur].rh)],
   [e => !e.altKey && e.key === "r" && D.review, () => showNotes(!document.body.classList.contains("notes-on"))],
 ];
 
@@ -2107,6 +2127,44 @@ function setNotesLeft(x, save = true) {
   grip.addEventListener("dblclick", () => setNotesLeft(0));
 }
 
+// ---------------------------------------------------------------- review marks
+// The browser stores the fingerprint of the change of each reviewed file. A file whose
+// change differs from its stored fingerprint shows a dash: reviewed, but changed since.
+// The page reads the storage again before each write, so two open tabs do not lose marks.
+const REVIEW_KEY = "blockdiff.reviewed";
+const reviewId = f => D.repo + ":" + pathOf(f);
+function loadReviewed() {
+  try { return JSON.parse(localStorage.getItem(REVIEW_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+let reviewed = loadReviewed();
+
+function setReviewed(i, on) {
+  reviewed = loadReviewed();
+  const f = D.files[i];
+  if (on) reviewed[reviewId(f)] = f.rh; else delete reviewed[reviewId(f)];
+  try { localStorage.setItem(REVIEW_KEY, JSON.stringify(reviewed)); } catch (e) { /* storage unavailable */ }
+  showReviewed();
+}
+
+function showReviewed() {
+  let done = 0, again = 0;
+  document.querySelectorAll("#files .fi").forEach((el, i) => {
+    const f = D.files[i], saved = reviewed[reviewId(f)], box = el.querySelector(".rv");
+    const ok = saved === f.rh, changed = saved !== undefined && !ok;
+    box.checked = ok;
+    box.indeterminate = changed;
+    box.title = ok ? "Reviewed. Click to clear (v)." : changed
+      ? "Reviewed, but the change differs now. Click to mark it reviewed again (v)."
+      : "Mark as reviewed (v)";
+    el.classList.toggle("reviewed", ok);
+    el.querySelector(".again").textContent = changed ? " · changed since review" : "";
+    done += ok; again += changed;
+  });
+  const c = document.getElementById("revcount");
+  if (c) c.textContent = `${done}/${D.files.length} reviewed` + (again ? ` · ${again} changed since review` : "");
+}
+window.addEventListener("storage", e => { if (e.key === REVIEW_KEY) { reviewed = loadReviewed(); showReviewed(); } });
+
 // ---------------------------------------------------------------- start
 (function init() {
   const list = document.getElementById("files");
@@ -2146,10 +2204,13 @@ function setNotesLeft(x, save = true) {
     const p = pathOf(f), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
     const el = document.createElement("div");
     el.className = "fi";
-    el.innerHTML = `<div><span class="st ${f.status}">${f.status}</span><span class="nm">${esc(base(p))}</span></div>` +
+    el.innerHTML = `<div><input type="checkbox" class="rv"><span class="st ${f.status}">${f.status}</span><span class="nm">${esc(base(p))}</span></div>` +
       `<div class="dir">${esc(dir)}</div>` +
       `<div class="cnt"><span class="p">+${counts.a}</span> <span class="m">−${counts.d}</span>` +
-      (counts.m ? ` · ${counts.m} moved/similar block ends` : "") + `</div>`;
+      (counts.m ? ` · ${counts.m} moved/similar block ends` : "") + `<span class="again"></span></div>`;
+    const box = el.querySelector(".rv");
+    box.addEventListener("click", e => { e.stopPropagation(); setReviewed(i, box.checked); });
+    box.addEventListener("dblclick", e => e.stopPropagation());
     el.addEventListener("click", () => { if (i !== cur) showFile(i); });
     if (f.disk) {
       el.title = "Double-click to open in VS Code";
@@ -2157,11 +2218,14 @@ function setNotesLeft(x, save = true) {
     }
     list.appendChild(el);
   });
+  showReviewed();
   const kinds = {moved: 0, similar: 0, reindent: 0};
   for (const m of D.moves) kinds[m[0]]++;
   document.getElementById("summary").textContent =
     `${D.title} · ${D.files.length} files · +${adds} −${dels} · ` +
     `${kinds.moved} moved, ${kinds.similar} similar, ${kinds.reindent} re-indented blocks`;
+  document.getElementById("summary").insertAdjacentHTML("afterend", '<span id="revcount"></span>');
+  showReviewed();
   // Optional deep link: #f=<file index or path suffix>&l=<line on the left side>&fold=1
   const h = new URLSearchParams(location.hash.slice(1));
   if (h.has("fold")) folding = h.get("fold") === "1";
@@ -2260,6 +2324,8 @@ def main() -> int:
         return 0
     payload = build_payload(Analysis(files), title)
     payload["pr"] = finish_pr_lookup(pr_proc)
+    # The review marks are per repository, so that equal paths in two repositories differ.
+    payload["repo"] = "" if args.dirs else run_git(args.repo, "rev-parse", "--show-toplevel").decode().strip()
     payload["review"] = load_notes(args.notes, files) if args.notes else None
     out = args.output
     if not out:

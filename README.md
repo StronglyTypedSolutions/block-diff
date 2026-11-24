@@ -26,6 +26,7 @@ The design follows Araxis Merge: two synchronized panes with curved connectors b
 - Clear labels: "moved", "moved, only indentation changed", or "moved with 2 changed lines". A marker at the left edge shows the changed lines in a moved block.
 - Word-level highlights in changed lines and in edited moved blocks. Removed words are red on the left. Added words are green on the right. The word diff runs over the whole changed block, so a reflowed comment marks only the words that really changed.
 - A flat list of all changed files. The selected file has a blue background and a bold name. Double-click a file to open it in VS Code at the line that shows in the right pane.
+- Review marks: tick the box next to a file when you reviewed it, or press `v`. When the change of a ticked file differs later, the box shows a dash and the file says "changed since review". The header counts the reviewed files.
 - Resizable panes: drag the middle bar to the left or right. Double-click it to restore the 50/50 split. The page remembers the split.
 - A minimap with the old file in the left half and the new file in the right half. Both halves use the shared scroll position. The thumb is a frame with one view in each half. Each view marks the rows that its pane shows. Thus you can see when one pane shows more of its file than the other, for example next to a long insertion. While blocks are aligned, the frame gives way to a link button, and the two views show both pane positions. You can click and drag the thumb.
 - Identical lines are hidden by default. Three context lines stay above and below each change. Press `h` to show all lines. The page remembers your choice.
@@ -135,13 +136,23 @@ The report is Markdown with this convention:
 
 The tool finds each hunk by its content, not by the line numbers in the `@@` header. A note thus still finds its lines after a rebase or after more commits. If the code changed after the report, the tool uses the lines that it still finds. The panel then marks the note as "approximate". The tool prints the number of notes that match no change. Raw HTML in the report shows as text.
 
+## Review marks
+
+Each file in the list has a box. Tick it when you reviewed the file, or press `v` for the current file. The box has three states:
+
+- Empty: not reviewed.
+- Ticked: reviewed. The name is dimmed.
+- A dash: you reviewed the file, but its change differs now. The file shows "changed since review". Tick the box again after you reviewed the new change.
+
+The page stores a fingerprint of each reviewed change in the browser storage, per repository and path. The fingerprint covers only the removed and added lines, not their line numbers. Thus a rebase that changes other parts of the file keeps the mark, but a new edit of the change clears it. The marks stay in the browser that you used, so another browser or another profile does not show them.
+
 ## Open files in VS Code
 
 The "Open file" button in the title bar of the right pane, or a double-click on a file in the list, opens a `vscode://file/...` link. VS Code installs the handler for these links. The first time, the browser asks if it can open the link. In revision mode, the link opens the file in the working tree. In folder mode, it opens the file in the right folder. Git difftool deletes its temporary copies after the call, so these files have no link. Working tree files in the difftool folder are links to the working tree, so these files keep their link.
 
 ## Settings
 
-The page keeps the "hide identical lines", theme, pane split, and notes panel settings (shown, height, left edge) in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
+The page keeps the "hide identical lines", theme, pane split, notes panel settings (shown, height, left edge), and review marks in the browser `localStorage`. Firefox gives each local file its own storage. For this reason, `blockdiff` always writes to the same file by default. Each new diff replaces this file. An open tab keeps its content until you reload it.
 
 The code uses JetBrains Mono at 14 px with a 20 px line height if the font is installed. Otherwise it uses the default monospace font.
 
@@ -157,6 +168,7 @@ The code uses JetBrains Mono at 14 px with a 20 px line height if the font is in
 | `Esc` | Link the panes again after you aligned a block. |
 | `t` | Switch the theme: system, dark, light. |
 | `r` | Hide or show the review notes panel (with `--notes`). |
+| `v` | Mark the current file as reviewed, or clear the mark. |
 
 Drag the middle bar to resize the panes. Double-click it to make both panes equally wide again. Click a band in the middle bar to align its left and right parts. Click a moved block to show both copies side by side, also when they are far apart. In both cases the alignment fades out when you scroll away, so the panes return to normal sync. While the alignment is active, the minimap shows a link button instead of the thumb. Click the link button or press `Esc` to link the panes again. For a move to another file, a click opens that file. Click a "⋯ N identical lines" row to show those lines.
 
